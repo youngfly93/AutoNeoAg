@@ -50,64 +50,66 @@ def smoke(rounds: int) -> None:
     base_branch = current_branch(ROOT) or "main"
     branch_name = "autoneoag/smoke"
     ensure_branch(ROOT, branch_name)
-    best_commit = current_commit(ROOT)
-    best_score = float("-inf")
-    best_checkpoint = ""
-    summary_lines = [prepare_stdout.strip()]
-    for round_id in range(1, rounds + 1):
-        description = "baseline"
-        proposal = {
-            "hypothesis": "baseline",
-            "expected_change": "baseline measurement",
-            "risk": "none",
-            "edit_scope": ["train.py"],
-            "summary": "baseline",
-        }
-        if round_id > 1:
-            proposal = run_codex_worker(settings, round_id, ROOT, "\n".join(summary_lines[-8:]))
-            description = proposal["summary"]
-            files = changed_files(ROOT)
-            if not files:
-                append_result(settings.results_tsv, round_id, best_commit, best_score, "discard", "no-op proposal")
-                summary_lines.append(json.dumps({"round": round_id, "val_score": best_score, "status": "discard", **proposal}, ensure_ascii=False))
-                continue
-            unexpected = [path for path in files if path != "train.py"]
-            if unexpected:
-                raise RuntimeError(f"Codex worker changed unexpected files: {unexpected}")
-            candidate_commit = commit_all(ROOT, f"smoke round {round_id}: {description}")
-        else:
-            candidate_commit = best_commit
-        stdout = run_python("train.py", "--mode", "smoke", "--round-id", str(round_id))
-        (log_dir / f"round_{round_id:02d}.log").write_text(stdout)
-        val_score = parse_metric(stdout)
-        status = "keep" if val_score > best_score + 1e-4 else "discard"
-        if round_id == 1 or status == "keep":
-            best_score = val_score
-            best_commit = current_commit(ROOT) if round_id > 1 else best_commit
-            best_checkpoint = str(settings.artifacts_runs / "smoke" / f"round_{round_id:02d}" / f"round_{round_id:02d}.pt")
-        elif round_id > 1:
-            reset_hard(ROOT, best_commit)
-        append_result(settings.results_tsv, round_id, candidate_commit, val_score, status, description)
-        summary_lines.append(json.dumps({"round": round_id, "val_score": val_score, "status": status, **proposal}, ensure_ascii=False))
-    confirm_out = run_python("confirm.py", "--mode", "smoke", "--checkpoint", best_checkpoint)
-    blind_out = run_python("blind_eval.py", "--mode", "smoke", "--checkpoint", best_checkpoint)
-    settings.smoke_report.write_text(
-        "\n".join(
-            [
-                "# Smoke Report",
-                "",
-                f"Best commit: {best_commit}",
-                f"Best val_score: {best_score:.6f}",
-                "",
-                "## Confirm",
-                confirm_out.strip(),
-                "",
-                "## Blind",
-                blind_out.strip(),
-            ]
+    try:
+        best_commit = current_commit(ROOT)
+        best_score = float("-inf")
+        best_checkpoint = ""
+        summary_lines = [prepare_stdout.strip()]
+        for round_id in range(1, rounds + 1):
+            description = "baseline"
+            proposal = {
+                "hypothesis": "baseline",
+                "expected_change": "baseline measurement",
+                "risk": "none",
+                "edit_scope": ["train.py"],
+                "summary": "baseline",
+            }
+            if round_id > 1:
+                proposal = run_codex_worker(settings, round_id, ROOT, "\n".join(summary_lines[-8:]))
+                description = proposal["summary"]
+                files = changed_files(ROOT)
+                if not files:
+                    append_result(settings.results_tsv, round_id, best_commit, best_score, "discard", "no-op proposal")
+                    summary_lines.append(json.dumps({"round": round_id, "val_score": best_score, "status": "discard", **proposal}, ensure_ascii=False))
+                    continue
+                unexpected = [path for path in files if path != "train.py"]
+                if unexpected:
+                    raise RuntimeError(f"Codex worker changed unexpected files: {unexpected}")
+                candidate_commit = commit_all(ROOT, f"smoke round {round_id}: {description}")
+            else:
+                candidate_commit = best_commit
+            stdout = run_python("train.py", "--mode", "smoke", "--round-id", str(round_id))
+            (log_dir / f"round_{round_id:02d}.log").write_text(stdout)
+            val_score = parse_metric(stdout)
+            status = "keep" if val_score > best_score + 1e-4 else "discard"
+            if round_id == 1 or status == "keep":
+                best_score = val_score
+                best_commit = current_commit(ROOT) if round_id > 1 else best_commit
+                best_checkpoint = str(settings.artifacts_runs / "smoke" / f"round_{round_id:02d}" / f"round_{round_id:02d}.pt")
+            elif round_id > 1:
+                reset_hard(ROOT, best_commit)
+            append_result(settings.results_tsv, round_id, candidate_commit, val_score, status, description)
+            summary_lines.append(json.dumps({"round": round_id, "val_score": val_score, "status": status, **proposal}, ensure_ascii=False))
+        confirm_out = run_python("confirm.py", "--mode", "smoke", "--checkpoint", best_checkpoint)
+        blind_out = run_python("blind_eval.py", "--mode", "smoke", "--checkpoint", best_checkpoint)
+        settings.smoke_report.write_text(
+            "\n".join(
+                [
+                    "# Smoke Report",
+                    "",
+                    f"Best commit: {best_commit}",
+                    f"Best val_score: {best_score:.6f}",
+                    "",
+                    "## Confirm",
+                    confirm_out.strip(),
+                    "",
+                    "## Blind",
+                    blind_out.strip(),
+                ]
+            )
         )
-    )
-    checkout_branch(ROOT, base_branch)
+    finally:
+        checkout_branch(ROOT, base_branch)
 
 
 def main() -> None:

@@ -30,8 +30,7 @@ Return JSON matching the provided schema.
         "--json",
         "--color",
         "never",
-        "--sandbox",
-        "workspace-write",
+        "--full-auto",
         "-C",
         str(root),
         "-c",
@@ -42,7 +41,14 @@ Return JSON matching the provided schema.
         str(output_path),
         prompt,
     ]
-    completed = subprocess.run(cmd, cwd=root, check=True, capture_output=True, text=True)
+    try:
+        completed = subprocess.run(cmd, cwd=root, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "codex exec failed\n"
+            f"exit_code: {exc.returncode}\n"
+            f"stdout:\n{exc.stdout}\n"
+            f"stderr:\n{exc.stderr}"
+        ) from exc
     _ = completed.stdout
     return json.loads(output_path.read_text())
-
