@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "hypothesis": {"type": "string"},
+    "expected_change": {"type": "string"},
+    "risk": {"type": "string"},
+    "edit_scope": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "summary": {"type": "string"}
+  },
+  "required": ["hypothesis", "expected_change", "risk", "edit_scope", "summary"],
+  "additionalProperties": false
+}
+

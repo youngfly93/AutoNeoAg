@@ -1,0 +1,33 @@
+[project]
+name = "AutoNeoAg"
+smoke_rounds = 10
+reasoning_effort = "medium"
+
+[paths]
+data_raw = "data/raw"
+data_interim = "data/interim"
+data_processed = "data/processed"
+artifacts_runs = "artifacts/runs"
+artifacts_cache = "artifacts/cache"
+artifacts_logs = "artifacts/logs"
+results_tsv = "results.tsv"
+smoke_report = "smoke_report.md"
+split_manifest = "data/processed/splits_grouped_v1.json"
+
+[environment]
+conda_env_name = "autoneoag-py312"
+conda_env_path = "/Volumes/AutoNeoAgEnv/autoneoag-py312"
+
+[dtu]
+netmhcpan_tar = "netMHCpan-4.2c.Darwin_arm64.tar"
+netmhcpan_home = ".local_tools/dtu/netMHCpan-4.2"
+netmhcstabpan_tar = "netMHCstabpan.Darwin_arm64.tar"
+netmhcstabpan_home = ".local_tools/dtu/netMHCstabpan"
+
+[smoke]
+dataset_resource = "smoke_seed.tsv"
+human_reference_resource = "smoke_human_reference.fasta"
+hla_pseudoseq_resource = "hla_pseudosequences.tsv"
+default_confirm_split = "confirm"
+default_blind_split = "blind"
+default_val_fold = 0
