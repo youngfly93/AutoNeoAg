@@ -38,18 +38,35 @@ SOURCE_META_COLUMNS = [
 ]
 
 ALIAS_GROUPS = {
-    "peptide_mut": ["peptide_mut", "mut_peptide", "mutant_peptide", "neo_peptide", "epitope", "peptide"],
-    "peptide_wt": ["peptide_wt", "wt_peptide", "wildtype_peptide", "reference_peptide", "wt_epitope", "reference_sequence"],
-    "hla": ["hla", "hla_allele", "mhc", "allele", "allele_name", "mhc_allele"],
-    "gene": ["gene", "gene_symbol", "antigen_gene"],
-    "aa_change": ["aa_change", "protein_change", "mutation", "variant", "variant_name"],
-    "study_id": ["study_id", "study", "cohort_id", "study_accession", "reference_id"],
-    "patient_id": ["patient_id", "patient", "sample_id", "subject_id"],
-    "assay_type": ["assay_type", "assay", "readout", "assay_group", "method"],
-    "label": ["label", "is_positive", "immunogenic", "response", "assay_result", "qualitative_measure"],
-    "label_tier": ["label_tier", "tier"],
+    "peptide_mut": [
+        "peptide_mut",
+        "mut_peptide",
+        "mutant_peptide",
+        "mutated_peptide",
+        "mutant_sequence",
+        "neo_peptide",
+        "epitope",
+        "peptide",
+    ],
+    "peptide_wt": [
+        "peptide_wt",
+        "wt_peptide",
+        "wildtype_peptide",
+        "wildtype_sequence",
+        "reference_peptide",
+        "wt_epitope",
+        "reference_sequence",
+    ],
+    "hla": ["hla", "hla_allele", "hla_type", "mhc", "allele", "allele_name", "mhc_allele"],
+    "gene": ["gene", "gene_symbol", "gene_name", "antigen_gene"],
+    "aa_change": ["aa_change", "amino_acid_change", "protein_change", "mutation", "variant", "variant_name"],
+    "study_id": ["study_id", "study", "study_name", "cohort_id", "study_accession", "reference_id"],
+    "patient_id": ["patient_id", "patient", "patient_or_sample", "sample_id", "sample_identifier", "subject_id"],
+    "assay_type": ["assay_type", "assay", "assay_readout", "readout", "assay_group", "method"],
+    "label": ["label", "functional_result", "immunogenicity", "is_positive", "immunogenic", "response", "assay_result", "qualitative_measure"],
+    "label_tier": ["label_tier", "record_tier", "tier"],
     "source_name": ["source_name", "source"],
-    "source_year": ["source_year", "year"],
+    "source_year": ["source_year", "pub_year", "year"],
     "is_tesla": ["is_tesla"],
     "is_simulated": ["is_simulated"],
     "is_mouse": ["is_mouse"],
@@ -187,6 +204,21 @@ def standardize_iedb_functional_immunology(frame: pd.DataFrame, source_row: dict
     return _normalize_functional_immunology(standardized, source_row, default_assay="iedb_functional", default_tier="A")
 
 
+def standardize_tumoragdb2_curated(frame: pd.DataFrame, source_row: dict[str, object]) -> pd.DataFrame:
+    standardized = _canonicalize_columns(frame)
+    required = [
+        "peptide_mut",
+        "peptide_wt",
+        "hla",
+        "gene",
+        "aa_change",
+        "study_id",
+        "label",
+    ]
+    _require_columns(standardized, required, str(source_row["source_id"]))
+    return _normalize_functional_immunology(standardized, source_row, default_assay="tumoragdb2_curated", default_tier="A")
+
+
 def run_manual_curated_adapter(settings: Settings, source_row: dict[str, object]) -> pd.DataFrame:
     raw_path = resolve_manifest_path(settings, str(source_row["raw_file_path"]))
     files = _list_tabular_files(raw_path)
@@ -215,10 +247,26 @@ def run_iedb_functional_adapter(settings: Settings, source_row: dict[str, object
     return standardize_iedb_functional_immunology(merged, source_row)
 
 
+def run_tumoragdb2_curated_adapter(settings: Settings, source_row: dict[str, object]) -> pd.DataFrame:
+    raw_path = resolve_manifest_path(settings, str(source_row["raw_file_path"]))
+    files = _list_tabular_files(raw_path)
+    if not files:
+        raise RuntimeError(f"No supported raw files found for source {source_row['source_id']} at {raw_path}")
+    frames = []
+    for file_path in files:
+        frame = _read_tabular_file(file_path)
+        frame["__source_file__"] = str(file_path)
+        frames.append(frame)
+    merged = pd.concat(frames, ignore_index=True)
+    return standardize_tumoragdb2_curated(merged, source_row)
+
+
 ADAPTER_REGISTRY = {
     "iedb_neo_functional_adapter": run_iedb_functional_adapter,
     "iedb_immunogenicity_adapter": run_iedb_functional_adapter,
+    "immuno_literature_manual_adapter": run_manual_curated_adapter,
     "neo_literature_manual_adapter": run_manual_curated_adapter,
+    "tumoragdb2_curated_adapter": run_tumoragdb2_curated_adapter,
 }
 
 
@@ -318,6 +366,72 @@ TEMPLATE_REGISTRY: dict[str, tuple[str, pd.DataFrame]] = {
                     "qualitative_measure": "Negative",
                     "year": 2021,
                     "tier": "A",
+                },
+            ]
+        ),
+    ),
+    "immuno_literature_manual_adapter": (
+        "template_manual_curated.tsv",
+        pd.DataFrame(
+            [
+                {
+                    "mut_peptide": "GILGFVFTL",
+                    "wt_peptide": "GILGFVYTL",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "TP53",
+                    "protein_change": "R175H",
+                    "study": "IMM-LIT-001",
+                    "patient": "IMM-L001",
+                    "readout": "ELISpot",
+                    "immunogenic": "positive",
+                    "year": 2024,
+                    "tier": "A",
+                },
+                {
+                    "mut_peptide": "LLGATCMFV",
+                    "wt_peptide": "LLGATCMFI",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "IDH1",
+                    "protein_change": "R132H",
+                    "study": "IMM-LIT-002",
+                    "patient": "IMM-L002",
+                    "readout": "Tetramer",
+                    "immunogenic": "negative",
+                    "year": 2023,
+                    "tier": "A",
+                },
+            ]
+        ),
+    ),
+    "tumoragdb2_curated_adapter": (
+        "template_tumoragdb2_curated.tsv",
+        pd.DataFrame(
+            [
+                {
+                    "mutated_peptide": "SPRWYFYYL",
+                    "wildtype_sequence": "SPRWYFYFL",
+                    "hla_type": "HLA-B*07:02",
+                    "gene_name": "PIK3CA",
+                    "amino_acid_change": "E545K",
+                    "study_name": "TADB-001",
+                    "sample_identifier": "TADB-P001",
+                    "assay_readout": "ELISpot",
+                    "functional_result": "positive",
+                    "pub_year": 2022,
+                    "record_tier": "A",
+                },
+                {
+                    "mutated_peptide": "KLVVVGAGG",
+                    "wildtype_sequence": "KLVVVGAGD",
+                    "hla_type": "HLA-A*03:01",
+                    "gene_name": "KRAS",
+                    "amino_acid_change": "G13D",
+                    "study_name": "TADB-002",
+                    "sample_identifier": "TADB-P002",
+                    "assay_readout": "Multimer",
+                    "functional_result": "negative",
+                    "pub_year": 2021,
+                    "record_tier": "B",
                 },
             ]
         ),

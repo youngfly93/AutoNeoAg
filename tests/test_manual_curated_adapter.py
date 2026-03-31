@@ -129,3 +129,106 @@ def test_iedb_functional_adapter_standardizes_rows(tmp_path: Path) -> None:
     assert standardized["patient_id"].tolist() == ["S001", "S002"]
     assert standardized["assay_type"].tolist() == ["ELISpot", "FACS"]
     assert standardized["mutation_event"].tolist() == ["KRAS:G12D", "EGFR:L858R"]
+
+
+def test_immuno_literature_manual_adapter_standardizes_rows(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "immuno_literature"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / "immuno_rows.tsv"
+    frame = pd.DataFrame(
+        [
+            {
+                "mut_peptide": "GILGFVFTL",
+                "wt_peptide": "GILGFVYTL",
+                "hla_allele": "HLA-A*02:01",
+                "gene_symbol": "TP53",
+                "protein_change": "R175H",
+                "study": "IMM-LIT-001",
+                "patient": "IMM-L001",
+                "readout": "ELISpot",
+                "immunogenic": "positive",
+                "year": 2024,
+            },
+            {
+                "mut_peptide": "LLGATCMFV",
+                "wt_peptide": "LLGATCMFI",
+                "hla_allele": "HLA-A*02:01",
+                "gene_symbol": "IDH1",
+                "protein_change": "R132H",
+                "study": "IMM-LIT-002",
+                "patient": "IMM-L002",
+                "readout": "Tetramer",
+                "immunogenic": "negative",
+                "year": 2023,
+            },
+        ]
+    )
+    frame.to_csv(raw_path, sep="\t", index=False)
+
+    settings = load_settings(Path.cwd())
+    source_row = {
+        "source_id": "immuno_curated_literature",
+        "source_name": "Manual curated human peptide immunogenicity literature set",
+        "adapter_id": "immuno_literature_manual_adapter",
+        "raw_file_path": str(raw_dir),
+        "year_end": 2025,
+    }
+    standardized = run_source_adapter(settings, source_row)
+
+    assert len(standardized) == 2
+    assert standardized["label"].tolist() == [1, 0]
+    assert standardized["source_id"].tolist() == ["immuno_curated_literature", "immuno_curated_literature"]
+    assert standardized["assay_type"].tolist() == ["ELISpot", "Tetramer"]
+
+
+def test_tumoragdb2_curated_adapter_standardizes_rows(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "tumoragdb2"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / "tumoragdb2_rows.tsv"
+    frame = pd.DataFrame(
+        [
+            {
+                "mutated_peptide": "SPRWYFYYL",
+                "wildtype_sequence": "SPRWYFYFL",
+                "hla_type": "HLA-B*07:02",
+                "gene_name": "PIK3CA",
+                "amino_acid_change": "E545K",
+                "study_name": "TADB-001",
+                "sample_identifier": "TADB-P001",
+                "assay_readout": "ELISpot",
+                "functional_result": "positive",
+                "pub_year": 2022,
+                "record_tier": "A",
+            },
+            {
+                "mutated_peptide": "KLVVVGAGG",
+                "wildtype_sequence": "KLVVVGAGD",
+                "hla_type": "HLA-A*03:01",
+                "gene_name": "KRAS",
+                "amino_acid_change": "G13D",
+                "study_name": "TADB-002",
+                "sample_identifier": "TADB-P002",
+                "assay_readout": "Multimer",
+                "functional_result": "negative",
+                "pub_year": 2021,
+                "record_tier": "B",
+            },
+        ]
+    )
+    frame.to_csv(raw_path, sep="\t", index=False)
+
+    settings = load_settings(Path.cwd())
+    source_row = {
+        "source_id": "neo_tumoragdb2_core",
+        "source_name": "TumorAgDB2.0 curated human HLA-I subset",
+        "adapter_id": "tumoragdb2_curated_adapter",
+        "raw_file_path": str(raw_dir),
+        "year_end": 2025,
+    }
+    standardized = run_source_adapter(settings, source_row)
+
+    assert len(standardized) == 2
+    assert standardized["label"].tolist() == [1, 0]
+    assert standardized["study_id"].tolist() == ["TADB-001", "TADB-002"]
+    assert standardized["patient_id"].tolist() == ["TADB-P001", "TADB-P002"]
+    assert standardized["mutation_event"].tolist() == ["PIK3CA:E545K", "KRAS:G13D"]
