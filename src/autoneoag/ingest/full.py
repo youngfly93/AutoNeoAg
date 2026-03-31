@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pandas as pd
 
 from autoneoag.config import Settings
-from autoneoag.manifests import resolve_manifest_path
+from autoneoag.manifests import load_manifest_bundle, resolve_manifest_path
+from autoneoag.splits.pipeline import assign_split_by_source_role
 
 
 CANONICAL_COLUMNS = [
@@ -24,6 +26,15 @@ CANONICAL_COLUMNS = [
     "is_tesla",
     "is_simulated",
     "is_mouse",
+]
+
+SOURCE_META_COLUMNS = [
+    "source_id",
+    "source_name",
+    "split_role",
+    "source_priority",
+    "download_method",
+    "label_strength",
 ]
 
 ALIAS_GROUPS = {
@@ -53,7 +64,10 @@ def _list_tabular_files(path: Path) -> list[Path]:
     files = sorted(
         file_path
         for file_path in path.iterdir()
-        if file_path.is_file() and file_path.suffix.lower() in {".tsv", ".csv", ".xlsx", ".xls"}
+        if file_path.is_file()
+        and not file_path.name.startswith("._")
+        and not file_path.name.startswith(".")
+        and file_path.suffix.lower() in {".tsv", ".csv", ".xlsx", ".xls"}
     )
     return files
 
@@ -208,6 +222,109 @@ ADAPTER_REGISTRY = {
 }
 
 
+TEMPLATE_REGISTRY: dict[str, tuple[str, pd.DataFrame]] = {
+    "neo_literature_manual_adapter": (
+        "template_manual_curated.tsv",
+        pd.DataFrame(
+            [
+                {
+                    "mut_peptide": "YLQPRTFLL",
+                    "wt_peptide": "YLQPRTFVL",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "KRAS",
+                    "protein_change": "G12D",
+                    "study": "LIT-001",
+                    "patient": "P001",
+                    "readout": "ELISpot",
+                    "immunogenic": "positive",
+                    "year": 2024,
+                    "tier": "A",
+                },
+                {
+                    "mut_peptide": "GLCTLVAML",
+                    "wt_peptide": "GLCTLVAMM",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "EGFR",
+                    "protein_change": "L858R",
+                    "study": "LIT-002",
+                    "patient": "P002",
+                    "readout": "FACS",
+                    "immunogenic": "negative",
+                    "year": 2023,
+                    "tier": "A",
+                },
+            ]
+        ),
+    ),
+    "iedb_neo_functional_adapter": (
+        "template_iedb_functional.csv",
+        pd.DataFrame(
+            [
+                {
+                    "epitope": "YLQPRTFLL",
+                    "reference_peptide": "YLQPRTFVL",
+                    "allele_name": "HLA-A*02:01",
+                    "antigen_gene": "KRAS",
+                    "variant_name": "G12D",
+                    "study_accession": "IEDB-001",
+                    "subject_id": "S001",
+                    "assay_group": "ELISpot",
+                    "qualitative_measure": "Positive",
+                    "year": 2022,
+                    "tier": "A",
+                },
+                {
+                    "epitope": "GLCTLVAML",
+                    "reference_peptide": "GLCTLVAMM",
+                    "allele_name": "HLA-A*02:01",
+                    "antigen_gene": "EGFR",
+                    "variant_name": "L858R",
+                    "study_accession": "IEDB-002",
+                    "subject_id": "S002",
+                    "assay_group": "FACS",
+                    "qualitative_measure": "Negative",
+                    "year": 2021,
+                    "tier": "A",
+                },
+            ]
+        ),
+    ),
+    "iedb_immunogenicity_adapter": (
+        "template_iedb_functional.csv",
+        pd.DataFrame(
+            [
+                {
+                    "epitope": "KLVALGINAV",
+                    "reference_peptide": "KLVALGINAI",
+                    "allele_name": "HLA-A*02:01",
+                    "antigen_gene": "PIK3CA",
+                    "variant_name": "H1047R",
+                    "study_accession": "IEDB-IMM-001",
+                    "subject_id": "IMM001",
+                    "assay_group": "ELISpot",
+                    "qualitative_measure": "Positive",
+                    "year": 2022,
+                    "tier": "A",
+                },
+                {
+                    "epitope": "SLYNTVATL",
+                    "reference_peptide": "SLYNTVAAL",
+                    "allele_name": "HLA-A*02:01",
+                    "antigen_gene": "BRAF",
+                    "variant_name": "V600E",
+                    "study_accession": "IEDB-IMM-002",
+                    "subject_id": "IMM002",
+                    "assay_group": "FACS",
+                    "qualitative_measure": "Negative",
+                    "year": 2021,
+                    "tier": "A",
+                },
+            ]
+        ),
+    ),
+}
+
+
 def run_source_adapter(settings: Settings, source_row: dict[str, object]) -> pd.DataFrame:
     adapter_id = str(source_row["adapter_id"])
     try:
@@ -215,3 +332,82 @@ def run_source_adapter(settings: Settings, source_row: dict[str, object]) -> pd.
     except KeyError as exc:
         raise RuntimeError(f"No adapter implementation is registered for {adapter_id}") from exc
     return adapter(settings, source_row)
+
+
+def _sample_uid(row: pd.Series) -> str:
+    key = "|".join(
+        [
+            str(row.get("source_id", "")),
+            str(row.get("study_id", "")),
+            str(row.get("patient_id", "")),
+            str(row.get("gene", "")),
+            str(row.get("aa_change", "")),
+            str(row.get("peptide_mut", "")),
+            str(row.get("hla", "")),
+            str(row.get("label", "")),
+        ]
+    )
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+def build_task_level_dataset(
+    standardized_frames: list[pd.DataFrame],
+    source_manifest: pd.DataFrame,
+    *,
+    num_folds: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not standardized_frames:
+        raise RuntimeError("Cannot build task-level full dataset without standardized source frames.")
+
+    combined = pd.concat(standardized_frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+    source_meta = source_manifest[SOURCE_META_COLUMNS].rename(columns={"split_role": "source_split_role"}).copy()
+    combined = combined.merge(source_meta, on=["source_id", "source_name"], how="left")
+    combined["source_split_role"] = combined["source_split_role"].fillna("train_candidate")
+    combined["source_priority"] = combined["source_priority"].fillna(999).astype(int)
+    combined["label_strength"] = combined["label_strength"].fillna("unknown").astype(str)
+    combined["download_method"] = combined["download_method"].fillna("unknown").astype(str)
+    combined["canonical_event_key"] = (
+        combined["gene"].astype(str)
+        + "|"
+        + combined["aa_change"].astype(str)
+        + "|"
+        + combined["peptide_mut"].astype(str)
+        + "|"
+        + combined["hla"].astype(str)
+    )
+    combined["sample_uid"] = combined.apply(_sample_uid, axis=1)
+
+    source_roles = {
+        str(row["source_id"]): str(row["split_role"])
+        for row in source_manifest[["source_id", "split_role"]].to_dict(orient="records")
+    }
+    combined = assign_split_by_source_role(combined, source_roles, num_folds=num_folds)
+    source_index = (
+        combined.groupby(["source_id", "source_split_role", "split"], as_index=False)
+        .size()
+        .rename(columns={"size": "rows"})
+        .sort_values(["source_split_role", "source_id", "split"])
+        .reset_index(drop=True)
+    )
+    return combined, source_index
+
+
+def write_source_template(settings: Settings, task_id: str, source_id: str) -> Path:
+    bundle = load_manifest_bundle(settings, task_id)
+    matches = bundle.source_manifest.loc[bundle.source_manifest["source_id"] == source_id]
+    if matches.empty:
+        raise RuntimeError(f"Unknown source_id {source_id!r} for task {task_id!r}")
+    source_row = matches.iloc[0].to_dict()
+    adapter_id = str(source_row["adapter_id"])
+    try:
+        filename, template = TEMPLATE_REGISTRY[adapter_id]
+    except KeyError as exc:
+        raise RuntimeError(f"No template is registered for adapter {adapter_id}") from exc
+    raw_root = resolve_manifest_path(settings, str(source_row["raw_file_path"]))
+    raw_root.mkdir(parents=True, exist_ok=True)
+    output_path = raw_root / filename
+    if output_path.suffix.lower() == ".tsv":
+        template.to_csv(output_path, sep="\t", index=False)
+    else:
+        template.to_csv(output_path, index=False)
+    return output_path

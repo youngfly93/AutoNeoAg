@@ -91,3 +91,41 @@ Phase 2 / 3 full ingest 后，会将 source-level selector 扩展为：
 - sample-level selector
 
 当前阶段只要求先把 blind / exclusion 边界写死，不要求先列出全部样本。
+
+## 当前可用的 full ingest 辅助命令
+
+已实现 source adapter 的任务，现在可以直接用下面两类命令：
+
+1. 生成 raw 模板：
+
+```bash
+python scripts/bootstrap_full_raw_templates.py --task neoantigen
+python scripts/bootstrap_full_raw_templates.py --task hla_immunogenicity
+```
+
+2. 校验单个 source 是否能被标准化：
+
+```bash
+python scripts/validate_full_source.py --task neoantigen --source neo_iedb_functional
+python scripts/validate_full_source.py --task neoantigen --source neo_literature_curated
+python scripts/validate_full_source.py --task hla_immunogenicity --source immuno_iedb_functional
+```
+
+3. 运行 task-level full prepare planning：
+
+```bash
+python prepare.py --task neoantigen --mode full
+python prepare.py --task hla_immunogenicity --mode full
+```
+
+在当前阶段，`prepare.py --mode full` 会：
+
+- 读取并校验 manifests
+- 解析 source adapter 状态
+- 对已实现且有 raw 文件的 source 执行标准化
+- 输出 `full_prepare_plan.json`
+- 产出 task-level `dataset.parquet`
+- 产出 sample-level `splits_grouped_v1.json`
+- 产出 `source_index.tsv`
+
+它还不会直接声明 full ingest 完成；真正 full-ready 仍然依赖更多 source adapter 和真实 raw 数据补齐。

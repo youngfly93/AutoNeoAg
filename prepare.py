@@ -19,7 +19,7 @@ from autoneoag.config import ensure_directories, load_settings, require_env
 from autoneoag.features.biochem import aromaticity, delta_residue_fraction, gravy, log_safe_ratio, non_polar_ratio
 from autoneoag.features.dtu import netmhcpan_predict, netmhcstabpan_predict
 from autoneoag.features.foreignness import blast_foreignness
-from autoneoag.ingest.full import run_source_adapter
+from autoneoag.ingest.full import build_task_level_dataset, run_source_adapter
 from autoneoag.manifests import load_manifest_bundle, resolve_manifest_path, write_manifest_summary
 from autoneoag.features.pseudoseq import load_pseudosequences
 from autoneoag.ingest.public import load_smoke_seed, write_raw_snapshot
@@ -163,14 +163,32 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
         standardized_frames.append(standardized)
 
     combined_path = None
+    full_dataset_path = None
+    full_split_manifest_path = None
+    source_index_path = None
+    full_rows = 0
+    full_splits: dict[str, int] = {}
     if standardized_frames:
         combined = pd.concat(standardized_frames, ignore_index=True)
         combined_path = standardized_dir / "standardized_sources.parquet"
         combined.to_parquet(combined_path, index=False)
+        full_dataset, source_index = build_task_level_dataset(
+            standardized_frames,
+            staged_sources,
+            num_folds=task.dev_num_folds,
+        )
+        full_dataset_path = processed_dataset_path(settings, task.task_id, "full")
+        full_dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        full_dataset.to_parquet(full_dataset_path, index=False)
+        full_split_manifest_path = write_manifest(full_dataset, split_manifest_path(settings, task.task_id, "full"))
+        source_index_path = interim_dir / "source_index.tsv"
+        source_index.to_csv(source_index_path, sep="\t", index=False)
+        full_rows = int(len(full_dataset))
+        full_splits = {str(key): int(value) for key, value in full_dataset["split"].value_counts().to_dict().items()}
 
     plan_payload = {
         "task_id": task.task_id,
-        "status": "phase1_manifest_validated",
+        "status": "phase2_sources_staged" if full_dataset_path is None else "phase2_dataset_materialized",
         "summary_path": str(summary_path),
         "staged_source_manifest_path": str(staged_sources_path),
         "num_sources": int(len(staged_sources)),
@@ -180,6 +198,11 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
         "standardized_outputs": standardized_outputs,
         "adapter_failures": adapter_failures,
         "combined_standardized_path": str(combined_path) if combined_path is not None else "",
+        "full_dataset_path": str(full_dataset_path) if full_dataset_path is not None else "",
+        "full_split_manifest_path": str(full_split_manifest_path) if full_split_manifest_path is not None else "",
+        "source_index_path": str(source_index_path) if source_index_path is not None else "",
+        "full_rows": full_rows,
+        "full_splits": full_splits,
         "train_candidate_sources": staged_sources.loc[staged_sources["split_role"] == "train_candidate", "source_id"].tolist(),
         "blind_only_sources": staged_sources.loc[staged_sources["split_role"] == "blind_only", "source_id"].tolist(),
     }
@@ -194,6 +217,11 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
         "missing_raw_sources": missing_raw_sources,
         "standardized_outputs": standardized_outputs,
         "adapter_failures": adapter_failures,
+        "full_dataset_path": full_dataset_path,
+        "full_split_manifest_path": full_split_manifest_path,
+        "source_index_path": source_index_path,
+        "full_rows": full_rows,
+        "full_splits": full_splits,
     }
 
 
@@ -218,6 +246,11 @@ def main() -> None:
         print(f"missing_raw_sources: {plan['missing_raw_sources']}")
         print(f"standardized_outputs: {plan['standardized_outputs']}")
         print(f"adapter_failures: {plan['adapter_failures']}")
+        print(f"full_dataset_path: {plan['full_dataset_path']}")
+        print(f"full_split_manifest_path: {plan['full_split_manifest_path']}")
+        print(f"source_index_path: {plan['source_index_path']}")
+        print(f"full_rows: {plan['full_rows']}")
+        print(f"full_splits: {plan['full_splits']}")
         return
     df = build_dataset(settings, task, args.mode)
     output_path = processed_dataset_path(settings, task.task_id, args.mode)
