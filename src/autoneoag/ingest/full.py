@@ -264,8 +264,12 @@ def run_tumoragdb2_curated_adapter(settings: Settings, source_row: dict[str, obj
 ADAPTER_REGISTRY = {
     "iedb_neo_functional_adapter": run_iedb_functional_adapter,
     "iedb_immunogenicity_adapter": run_iedb_functional_adapter,
+    "immuno_external_lockbox_adapter": run_manual_curated_adapter,
     "immuno_literature_manual_adapter": run_manual_curated_adapter,
+    "immuno_timesplit_holdout_adapter": run_manual_curated_adapter,
     "neo_literature_manual_adapter": run_manual_curated_adapter,
+    "neo_timesplit_holdout_adapter": run_manual_curated_adapter,
+    "tesla_lockbox_adapter": run_manual_curated_adapter,
     "tumoragdb2_curated_adapter": run_tumoragdb2_curated_adapter,
 }
 
@@ -432,6 +436,138 @@ TEMPLATE_REGISTRY: dict[str, tuple[str, pd.DataFrame]] = {
                     "functional_result": "negative",
                     "pub_year": 2021,
                     "record_tier": "B",
+                },
+            ]
+        ),
+    ),
+    "tesla_lockbox_adapter": (
+        "template_tesla_lockbox.tsv",
+        pd.DataFrame(
+            [
+                {
+                    "mut_peptide": "ATGAAIFQK",
+                    "wt_peptide": "ATGAAIFQR",
+                    "hla_allele": "HLA-A*11:01",
+                    "gene_symbol": "PIK3CA",
+                    "protein_change": "H1047R",
+                    "study": "TESLA-001",
+                    "patient": "TESLA-P001",
+                    "readout": "ELISpot",
+                    "immunogenic": "positive",
+                    "year": 2020,
+                    "tier": "A",
+                },
+                {
+                    "mut_peptide": "KVFAFPFTI",
+                    "wt_peptide": "KVFAFPFTV",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "TP53",
+                    "protein_change": "R273C",
+                    "study": "TESLA-002",
+                    "patient": "TESLA-P002",
+                    "readout": "Tetramer",
+                    "immunogenic": "negative",
+                    "year": 2020,
+                    "tier": "A",
+                },
+            ]
+        ),
+    ),
+    "neo_timesplit_holdout_adapter": (
+        "template_neo_2024plus.tsv",
+        pd.DataFrame(
+            [
+                {
+                    "mut_peptide": "LLDFVRFMGV",
+                    "wt_peptide": "LLDFVRFMAV",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "BRAF",
+                    "protein_change": "V600E",
+                    "study": "OOT-NEO-001",
+                    "patient": "OOTN001",
+                    "readout": "ELISpot",
+                    "immunogenic": "positive",
+                    "year": 2025,
+                    "tier": "A",
+                },
+                {
+                    "mut_peptide": "SIINFEKQL",
+                    "wt_peptide": "SIINFEKEL",
+                    "hla_allele": "HLA-B*08:01",
+                    "gene_symbol": "NRAS",
+                    "protein_change": "Q61R",
+                    "study": "OOT-NEO-002",
+                    "patient": "OOTN002",
+                    "readout": "Multimer",
+                    "immunogenic": "negative",
+                    "year": 2024,
+                    "tier": "A",
+                },
+            ]
+        ),
+    ),
+    "immuno_external_lockbox_adapter": (
+        "template_immuno_external_lockbox.tsv",
+        pd.DataFrame(
+            [
+                {
+                    "mut_peptide": "YLQPRTFLL",
+                    "wt_peptide": "YLQPRTFVL",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "KRAS",
+                    "protein_change": "G12D",
+                    "study": "IMM-EXT-001",
+                    "patient": "IMME001",
+                    "readout": "ELISpot",
+                    "immunogenic": "positive",
+                    "year": 2022,
+                    "tier": "A",
+                },
+                {
+                    "mut_peptide": "GLLGTLVAML",
+                    "wt_peptide": "GLLGTLVAMM",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "EGFR",
+                    "protein_change": "L858R",
+                    "study": "IMM-EXT-002",
+                    "patient": "IMME002",
+                    "readout": "FACS",
+                    "immunogenic": "negative",
+                    "year": 2021,
+                    "tier": "A",
+                },
+            ]
+        ),
+    ),
+    "immuno_timesplit_holdout_adapter": (
+        "template_immuno_2024plus.tsv",
+        pd.DataFrame(
+            [
+                {
+                    "mut_peptide": "CLGGLLTMV",
+                    "wt_peptide": "CLGGLLTMI",
+                    "hla_allele": "HLA-A*02:01",
+                    "gene_symbol": "IDH1",
+                    "protein_change": "R132H",
+                    "study": "OOT-IMM-001",
+                    "patient": "OOTI001",
+                    "readout": "ELISpot",
+                    "immunogenic": "positive",
+                    "year": 2025,
+                    "tier": "A",
+                },
+                {
+                    "mut_peptide": "GLCTLVAMLV",
+                    "wt_peptide": "GLCTLVAMLI",
+                    "hla_allele": "HLA-B*07:02",
+                    "gene_symbol": "PIK3CA",
+                    "protein_change": "E545K",
+                    "study": "OOT-IMM-002",
+                    "patient": "OOTI002",
+                    "readout": "Tetramer",
+                    "immunogenic": "negative",
+                    "year": 2024,
+                    "tier": "A",
                 },
             ]
         ),

@@ -232,3 +232,103 @@ def test_tumoragdb2_curated_adapter_standardizes_rows(tmp_path: Path) -> None:
     assert standardized["study_id"].tolist() == ["TADB-001", "TADB-002"]
     assert standardized["patient_id"].tolist() == ["TADB-P001", "TADB-P002"]
     assert standardized["mutation_event"].tolist() == ["PIK3CA:E545K", "KRAS:G13D"]
+
+
+def test_neo_timesplit_holdout_adapter_standardizes_rows(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "neo_2024plus"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / "neo_2024plus_rows.tsv"
+    frame = pd.DataFrame(
+        [
+            {
+                "mut_peptide": "LLDFVRFMGV",
+                "wt_peptide": "LLDFVRFMAV",
+                "hla_allele": "HLA-A*02:01",
+                "gene_symbol": "BRAF",
+                "protein_change": "V600E",
+                "study": "OOT-NEO-001",
+                "patient": "OOTN001",
+                "readout": "ELISpot",
+                "immunogenic": "positive",
+                "year": 2025,
+            },
+            {
+                "mut_peptide": "SIINFEKQL",
+                "wt_peptide": "SIINFEKEL",
+                "hla_allele": "HLA-B*08:01",
+                "gene_symbol": "NRAS",
+                "protein_change": "Q61R",
+                "study": "OOT-NEO-002",
+                "patient": "OOTN002",
+                "readout": "Multimer",
+                "immunogenic": "negative",
+                "year": 2024,
+            },
+        ]
+    )
+    frame.to_csv(raw_path, sep="\t", index=False)
+
+    settings = load_settings(Path.cwd())
+    source_row = {
+        "source_id": "neo_2024plus",
+        "source_name": "2024-2025 out-of-time literature holdout",
+        "adapter_id": "neo_timesplit_holdout_adapter",
+        "raw_file_path": str(raw_dir),
+        "year_end": 2025,
+    }
+    standardized = run_source_adapter(settings, source_row)
+
+    assert len(standardized) == 2
+    assert standardized["label"].tolist() == [1, 0]
+    assert standardized["source_id"].tolist() == ["neo_2024plus", "neo_2024plus"]
+    assert standardized["study_id"].tolist() == ["OOT-NEO-001", "OOT-NEO-002"]
+
+
+def test_immuno_external_lockbox_adapter_standardizes_rows(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "immuno_external"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / "immuno_external_rows.tsv"
+    frame = pd.DataFrame(
+        [
+            {
+                "mut_peptide": "YLQPRTFLL",
+                "wt_peptide": "YLQPRTFVL",
+                "hla_allele": "HLA-A*02:01",
+                "gene_symbol": "KRAS",
+                "protein_change": "G12D",
+                "study": "IMM-EXT-001",
+                "patient": "IMME001",
+                "readout": "ELISpot",
+                "immunogenic": "positive",
+                "year": 2022,
+            },
+            {
+                "mut_peptide": "GLLGTLVAML",
+                "wt_peptide": "GLLGTLVAMM",
+                "hla_allele": "HLA-A*02:01",
+                "gene_symbol": "EGFR",
+                "protein_change": "L858R",
+                "study": "IMM-EXT-002",
+                "patient": "IMME002",
+                "readout": "FACS",
+                "immunogenic": "negative",
+                "year": 2021,
+            },
+        ]
+    )
+    frame.to_csv(raw_path, sep="\t", index=False)
+
+    settings = load_settings(Path.cwd())
+    source_row = {
+        "source_id": "immuno_external_study",
+        "source_name": "Study-held-out external human HLA-I cohort",
+        "adapter_id": "immuno_external_lockbox_adapter",
+        "raw_file_path": str(raw_dir),
+        "year_end": 2025,
+    }
+    standardized = run_source_adapter(settings, source_row)
+
+    assert len(standardized) == 2
+    assert standardized["label"].tolist() == [1, 0]
+    assert standardized["source_id"].tolist() == ["immuno_external_study", "immuno_external_study"]
+    assert standardized["study_id"].tolist() == ["IMM-EXT-001", "IMM-EXT-002"]
