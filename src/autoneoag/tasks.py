@@ -32,6 +32,7 @@ TASK_SPECS: dict[str, TaskSpec] = {
         reference_resource="smoke_human_reference.fasta",
         require_dtu=True,
         require_foreignness=True,
+        full_enabled=True,
     ),
     "hla_immunogenicity": TaskSpec(
         task_id="hla_immunogenicity",
@@ -42,6 +43,7 @@ TASK_SPECS: dict[str, TaskSpec] = {
         reference_resource="smoke_human_reference.fasta",
         require_dtu=True,
         require_foreignness=True,
+        full_enabled=True,
     ),
     "variant_prioritization": TaskSpec(
         task_id="variant_prioritization",
@@ -81,6 +83,10 @@ def split_manifest_path(settings: Settings, task_id: str, mode: str) -> Path:
 
 def raw_snapshot_path(settings: Settings, task_id: str, mode: str) -> Path:
     return settings.data_raw / task_id / f"{mode}_raw.tsv"
+
+
+def task_interim_dir(settings: Settings, task_id: str, mode: str) -> Path:
+    return settings.data_interim / task_id / mode
 
 
 def run_dir(settings: Settings, task_id: str, mode: str, strategy: str, run_id: int, round_id: int) -> Path:

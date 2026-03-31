@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -18,10 +19,11 @@ from autoneoag.config import ensure_directories, load_settings, require_env
 from autoneoag.features.biochem import aromaticity, delta_residue_fraction, gravy, log_safe_ratio, non_polar_ratio
 from autoneoag.features.dtu import netmhcpan_predict, netmhcstabpan_predict
 from autoneoag.features.foreignness import blast_foreignness
+from autoneoag.manifests import load_manifest_bundle, resolve_manifest_path, write_manifest_summary
 from autoneoag.features.pseudoseq import load_pseudosequences
 from autoneoag.ingest.public import load_smoke_seed, write_raw_snapshot
 from autoneoag.splits.pipeline import assign_splits, exact_dedup, write_manifest
-from autoneoag.tasks import get_task_spec, list_task_ids, processed_dataset_path, split_manifest_path
+from autoneoag.tasks import get_task_spec, list_task_ids, processed_dataset_path, split_manifest_path, task_interim_dir
 
 
 def _verify_hard_requirements(settings, task, mode: str) -> None:
@@ -29,10 +31,14 @@ def _verify_hard_requirements(settings, task, mode: str) -> None:
         raise RuntimeError(f"Missing NetMHCpan install at {settings.netmhcpan_home}")
     if task.require_dtu and not settings.netmhcstabpan_home.exists():
         raise RuntimeError(f"Missing NetMHCstabpan install at {settings.netmhcstabpan_home}")
-    if mode == "full":
+
+
+def _verify_manifest_credentials(bundle) -> None:
+    download_methods = set(bundle.source_manifest["download_method"].tolist())
+    if "synapse_download" in download_methods:
         require_env("SYNAPSE_USERNAME")
         if not (Path.home() / ".synapseConfig").exists() and not ("SYNAPSE_API_TOKEN" in __import__("os").environ):
-            raise RuntimeError("Full mode requires Synapse credentials via ~/.synapseConfig or SYNAPSE_API_TOKEN")
+            raise RuntimeError("Synapse-backed full ingest requires ~/.synapseConfig or SYNAPSE_API_TOKEN")
 
 
 def _attach_common_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -117,6 +123,48 @@ def build_dataset(settings, task, mode: str) -> pd.DataFrame:
     raise RuntimeError(f"Unsupported task family: {task.family}")
 
 
+def stage_full_preparation_plan(settings, task) -> dict[str, object]:
+    bundle = load_manifest_bundle(settings, task.task_id)
+    _verify_manifest_credentials(bundle)
+
+    interim_dir = task_interim_dir(settings, task.task_id, "full")
+    interim_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_path = write_manifest_summary(bundle, interim_dir / "manifest_summary.json")
+
+    staged_sources = bundle.source_manifest.copy()
+    staged_sources["resolved_raw_path"] = [str(resolve_manifest_path(settings, value)) for value in staged_sources["raw_file_path"]]
+    staged_sources["raw_exists"] = [Path(path).exists() for path in staged_sources["resolved_raw_path"]]
+    staged_sources["adapter_ready"] = staged_sources["ingest_status"] == "implemented"
+    staged_sources_path = interim_dir / "source_manifest_staged.tsv"
+    staged_sources.to_csv(staged_sources_path, sep="\t", index=False)
+
+    blocked_sources = staged_sources.loc[staged_sources["ingest_status"] != "implemented", "source_id"].tolist()
+    missing_raw_sources = staged_sources.loc[~staged_sources["raw_exists"], "source_id"].tolist()
+    plan_payload = {
+        "task_id": task.task_id,
+        "status": "phase1_manifest_validated",
+        "summary_path": str(summary_path),
+        "staged_source_manifest_path": str(staged_sources_path),
+        "num_sources": int(len(staged_sources)),
+        "implemented_sources": staged_sources.loc[staged_sources["ingest_status"] == "implemented", "source_id"].tolist(),
+        "blocked_sources": blocked_sources,
+        "missing_raw_sources": missing_raw_sources,
+        "train_candidate_sources": staged_sources.loc[staged_sources["split_role"] == "train_candidate", "source_id"].tolist(),
+        "blind_only_sources": staged_sources.loc[staged_sources["split_role"] == "blind_only", "source_id"].tolist(),
+    }
+    plan_path = interim_dir / "full_prepare_plan.json"
+    plan_path.write_text(json.dumps(plan_payload, indent=2, sort_keys=True))
+    return {
+        "task_id": task.task_id,
+        "summary_path": summary_path,
+        "staged_source_manifest_path": staged_sources_path,
+        "plan_path": plan_path,
+        "blocked_sources": blocked_sources,
+        "missing_raw_sources": missing_raw_sources,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=list_task_ids(), required=True)
@@ -128,6 +176,15 @@ def main() -> None:
     _verify_hard_requirements(settings, task, args.mode)
     if args.mode == "full" and not task.full_enabled:
         raise RuntimeError(f"Task {task.task_id} full ingest is intentionally blocked until source manifests are provided.")
+    if args.mode == "full":
+        plan = stage_full_preparation_plan(settings, task)
+        print(f"task_id: {plan['task_id']}")
+        print(f"manifest_summary_path: {plan['summary_path']}")
+        print(f"staged_source_manifest_path: {plan['staged_source_manifest_path']}")
+        print(f"full_prepare_plan_path: {plan['plan_path']}")
+        print(f"blocked_sources: {plan['blocked_sources']}")
+        print(f"missing_raw_sources: {plan['missing_raw_sources']}")
+        return
     df = build_dataset(settings, task, args.mode)
     output_path = processed_dataset_path(settings, task.task_id, args.mode)
     output_path.parent.mkdir(parents=True, exist_ok=True)

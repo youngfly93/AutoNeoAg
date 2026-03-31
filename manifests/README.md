@@ -23,3 +23,71 @@
 - `hla_immunogenicity/`
 
 这些文件的目标不是替代最终数据整理，而是确保 full ingest 开始前，证据层规则已经先被写下来并可审阅。
+
+## Source Manifest 字段约定
+
+`source_manifest.csv` 当前采用统一字段：
+
+- `source_id`
+- `source_name`
+- `task_id`
+- `source_type`
+- `download_method`
+- `adapter_id`
+- `ingest_status`
+- `license_or_access`
+- `raw_file_path`
+- `source_priority`
+- `expected_format`
+- `assay_scope`
+- `species_scope`
+- `hla_scope`
+- `split_role`
+- `label_strength`
+- `is_train_eligible`
+- `is_confirm_eligible`
+- `is_blind_only`
+- `year_start`
+- `year_end`
+- `normalization_profile`
+- `notes`
+
+关键字段解释：
+
+- `adapter_id`
+  对应后续 full ingest 的 source adapter 标识。
+
+- `ingest_status`
+  当前允许的值：
+  - `planned`
+  - `manual_required`
+  - `implemented`
+  - `external_lockbox`
+
+- `source_priority`
+  用于确定 full ingest 的首批接入顺序。数值越小越优先。
+
+- `expected_format`
+  预期原始文件格式，例如 `csv`, `tsv`, `xlsx`, `json`, `mixed_manual_bundle`。
+
+- `split_role`
+  当前允许的值：
+  - `train_candidate`
+  - `confirm_candidate`
+  - `blind_only`
+  - `excluded_aux_only`
+
+- `normalization_profile`
+  说明该来源进入标准化表前需要套用的字段映射 / 清洗规则。
+
+## Lockbox Manifest 说明
+
+`lockbox_manifest.csv` 当前是 source-level selector，不是最终 sample-level lockbox。
+
+Phase 2 / 3 full ingest 后，会将 source-level selector 扩展为：
+
+- source-level selector
+- study-level selector
+- sample-level selector
+
+当前阶段只要求先把 blind / exclusion 边界写死，不要求先列出全部样本。
