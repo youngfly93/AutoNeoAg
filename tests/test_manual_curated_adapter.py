@@ -77,3 +77,55 @@ def test_neo_literature_manual_adapter_standardizes_rows(tmp_path: Path) -> None
         "peptide_length",
         "source_id",
     }
+
+
+def test_iedb_functional_adapter_standardizes_rows(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "iedb_functional"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / "iedb_rows.csv"
+    frame = pd.DataFrame(
+        [
+            {
+                "epitope": "YLQPRTFLL",
+                "reference_peptide": "YLQPRTFVL",
+                "allele_name": "HLA-A*02:01",
+                "antigen_gene": "KRAS",
+                "variant_name": "G12D",
+                "study_accession": "IEDB-001",
+                "subject_id": "S001",
+                "assay_group": "ELISpot",
+                "qualitative_measure": "Positive",
+                "year": 2022,
+            },
+            {
+                "epitope": "GLCTLVAML",
+                "reference_peptide": "GLCTLVAMM",
+                "allele_name": "HLA-A*02:01",
+                "antigen_gene": "EGFR",
+                "variant_name": "L858R",
+                "study_accession": "IEDB-002",
+                "subject_id": "S002",
+                "assay_group": "FACS",
+                "qualitative_measure": "Negative",
+                "year": 2021,
+            },
+        ]
+    )
+    frame.to_csv(raw_path, index=False)
+
+    settings = load_settings(Path.cwd())
+    source_row = {
+        "source_id": "neo_iedb_functional",
+        "source_name": "IEDB human HLA-I neoantigen functional subset",
+        "adapter_id": "iedb_neo_functional_adapter",
+        "raw_file_path": str(raw_dir),
+        "year_end": 2025,
+    }
+    standardized = run_source_adapter(settings, source_row)
+
+    assert len(standardized) == 2
+    assert standardized["label"].tolist() == [1, 0]
+    assert standardized["study_id"].tolist() == ["IEDB-001", "IEDB-002"]
+    assert standardized["patient_id"].tolist() == ["S001", "S002"]
+    assert standardized["assay_type"].tolist() == ["ELISpot", "FACS"]
+    assert standardized["mutation_event"].tolist() == ["KRAS:G12D", "EGFR:L858R"]
