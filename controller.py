@@ -30,6 +30,15 @@ def run_python(module: str, *args: str) -> str:
     return completed.stdout
 
 
+def format_subprocess_failure(exc: subprocess.CalledProcessError) -> str:
+    parts = []
+    if exc.stdout:
+        parts.append(exc.stdout.strip())
+    if exc.stderr:
+        parts.append(exc.stderr.strip())
+    return "\n\n".join(part for part in parts if part).strip()
+
+
 def parse_metric(stdout: str, key: str = "val_score") -> float:
     for line in stdout.splitlines():
         if line.startswith(f"{key}:"):
@@ -78,7 +87,28 @@ def smoke(rounds: int) -> None:
                 candidate_commit = commit_all(ROOT, f"smoke round {round_id}: {description}")
             else:
                 candidate_commit = best_commit
-            stdout = run_python("train.py", "--mode", "smoke", "--round-id", str(round_id))
+            try:
+                stdout = run_python("train.py", "--mode", "smoke", "--round-id", str(round_id))
+            except subprocess.CalledProcessError as exc:
+                failure_log = format_subprocess_failure(exc) or f"train.py failed with exit code {exc.returncode}"
+                (log_dir / f"round_{round_id:02d}.log").write_text(failure_log)
+                if round_id == 1:
+                    raise RuntimeError(f"Baseline training failed for round {round_id}\n{failure_log}") from exc
+                reset_hard(ROOT, best_commit)
+                append_result(settings.results_tsv, round_id, candidate_commit, float("nan"), "discard", f"{description} [train failed]")
+                summary_lines.append(
+                    json.dumps(
+                        {
+                            "round": round_id,
+                            "val_score": None,
+                            "status": "discard",
+                            "failure": "train_failed",
+                            **proposal,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                continue
             (log_dir / f"round_{round_id:02d}.log").write_text(stdout)
             val_score = parse_metric(stdout)
             status = "keep" if val_score > best_score + 1e-4 else "discard"
