@@ -15,6 +15,8 @@ You are proposing experiment round {round_id} for AutoNeoAg.
 Read program.md and train.py, then modify only train.py.
 Do not touch any other file.
 Keep the change small and compatible with MPS/CPU.
+Prefer structural edits in the sequence encoder, scalar feature usage, WT-vs-Mut interaction terms, and fusion block.
+Avoid isolated tweaks to loss functions, label smoothing, class weights, sampling, or output-bias initialization unless paired with a clear representation change.
 
 Recent summary:
 {summary}

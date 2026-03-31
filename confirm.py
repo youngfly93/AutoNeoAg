@@ -27,7 +27,7 @@ def evaluate_split(mode: str, checkpoint: str, split_name: str) -> dict[str, flo
     model = train_mod.NeoantigenRanker(cfg)
     model.load_state_dict(model_payload["state_dict"])
     model.eval()
-    arrays = train_mod.build_arrays(split_df)
+    arrays = train_mod.build_arrays(split_df, cfg)
     scores, labels = [], []
     with torch.no_grad():
         for idx in range(len(split_df)):
@@ -52,4 +52,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
