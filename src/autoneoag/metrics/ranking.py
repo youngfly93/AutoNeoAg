@@ -14,7 +14,7 @@ def ppv_at_k(labels: np.ndarray, scores: np.ndarray, k: int) -> float:
 
 
 def ndcg_at_k(labels: np.ndarray, scores: np.ndarray, k: int) -> float:
-    if len(labels) == 0 or np.all(labels == 0):
+    if len(labels) < 2 or np.all(labels == 0):
         return 0.0
     return float(ndcg_score(labels.reshape(1, -1), scores.reshape(1, -1), k=min(k, len(labels))))
 
@@ -38,4 +38,3 @@ def metric_bundle(labels: np.ndarray, scores: np.ndarray) -> dict[str, float]:
 
 def summarize_metrics(metrics: dict[str, float]) -> str:
     return "\n".join(f"{key}: {value:.6f}" for key, value in metrics.items())
-

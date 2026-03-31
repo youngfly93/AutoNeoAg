@@ -427,7 +427,7 @@ TEMPLATE_REGISTRY: dict[str, tuple[str, pd.DataFrame]] = {
                 {
                     "mutated_peptide": "KLVVVGAGG",
                     "wildtype_sequence": "KLVVVGAGD",
-                    "hla_type": "HLA-A*03:01",
+                    "hla_type": "HLA-A*11:01",
                     "gene_name": "KRAS",
                     "amino_acid_change": "G13D",
                     "study_name": "TADB-002",

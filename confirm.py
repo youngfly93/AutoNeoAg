@@ -26,8 +26,16 @@ from autoneoag.tasks import get_task_spec, list_task_ids, processed_dataset_path
 def evaluate_split(task_id: str, mode: str, checkpoint: str, split_name: str) -> dict[str, float]:
     settings = load_settings(ROOT)
     task = get_task_spec(task_id)
-    df = load_processed_dataset(processed_dataset_path(settings, task.task_id, mode))
+    dataset_path = processed_dataset_path(settings, task.task_id, mode)
+    if not dataset_path.exists():
+        raise RuntimeError(
+            f"Processed dataset is missing for task={task.task_id} mode={mode}. "
+            f"Run `python prepare.py --task {task.task_id} --mode {mode}` first."
+        )
+    df = load_processed_dataset(dataset_path)
     split_df = df[df["split"] == split_name].reset_index(drop=True)
+    if split_df.empty:
+        raise RuntimeError(f"Split {split_name!r} is empty for task={task.task_id} mode={mode}.")
     model_payload = torch.load(Path(checkpoint), map_location="cpu")
     cfg = train_mod.TrainConfig(**model_payload["config"])
     model = train_mod.NeoantigenRanker(cfg)
@@ -59,8 +67,6 @@ def main() -> None:
     parser.add_argument("--mode", choices=["smoke", "full"], required=True)
     parser.add_argument("--checkpoint", required=True)
     args = parser.parse_args()
-    if args.mode == "full":
-        raise RuntimeError("Full confirm requires completed full ingest.")
     metrics = evaluate_split(args.task, args.mode, args.checkpoint, "confirm")
     print(json.dumps(metrics, indent=2, sort_keys=True))
 

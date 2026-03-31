@@ -54,14 +54,20 @@ def _attach_common_features(df: pd.DataFrame) -> pd.DataFrame:
     return attached
 
 
-def build_immunology_smoke_dataset(settings, task) -> pd.DataFrame:
-    base = exact_dedup(load_smoke_seed(settings, task))
-    write_raw_snapshot(base, settings, task, "smoke")
+def materialize_immunology_features(settings, task, base: pd.DataFrame) -> pd.DataFrame:
     pseudoseqs = load_pseudosequences(settings, task)
-    mut_aff = netmhcpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist()).drop_duplicates(
+    attached = base.copy().reset_index(drop=True)
+    attached["hla_pseudosequence"] = attached["hla"].map(pseudoseqs)
+    if attached["hla_pseudosequence"].isna().any():
+        missing = sorted(attached.loc[attached["hla_pseudosequence"].isna(), "hla"].unique().tolist())
+        raise RuntimeError(f"Missing HLA pseudosequences for task {task.task_id}: {missing}")
+
+    mut_queries = attached[["peptide_mut", "hla"]].drop_duplicates().reset_index(drop=True)
+    mut_aff = netmhcpan_predict(settings, mut_queries["peptide_mut"].tolist(), mut_queries["hla"].tolist()).drop_duplicates(
         subset=["peptide_mut", "hla"]
     )
-    wt_aff = netmhcpan_predict(settings, base["peptide_wt"].tolist(), base["hla"].tolist()).rename(
+    wt_queries = attached[["peptide_wt", "hla"]].drop_duplicates().reset_index(drop=True)
+    wt_aff = netmhcpan_predict(settings, wt_queries["peptide_wt"].tolist(), wt_queries["hla"].tolist()).rename(
         columns={
             "peptide_mut": "peptide_wt",
             "ba_score": "wt_ba_score",
@@ -70,17 +76,23 @@ def build_immunology_smoke_dataset(settings, task) -> pd.DataFrame:
             "el_rank": "wt_el_rank",
         }
     ).drop_duplicates(subset=["peptide_wt", "hla"])
-    stab = netmhcstabpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist()).drop_duplicates(
+    stab = netmhcstabpan_predict(settings, mut_queries["peptide_mut"].tolist(), mut_queries["hla"].tolist()).drop_duplicates(
         subset=["peptide_mut", "hla"]
     )
-    foreignness = blast_foreignness(settings, task, base["peptide_mut"].tolist())
-    df = base.merge(mut_aff, on=["peptide_mut", "hla"]).merge(wt_aff, on=["peptide_wt", "hla"]).merge(
+    foreignness = blast_foreignness(settings, task, attached["peptide_mut"].tolist())
+
+    df = attached.merge(mut_aff, on=["peptide_mut", "hla"]).merge(wt_aff, on=["peptide_wt", "hla"]).merge(
         stab, on=["peptide_mut", "hla"]
     )
     df = pd.concat([df.reset_index(drop=True), foreignness.reset_index(drop=True)], axis=1)
-    df["hla_pseudosequence"] = df["hla"].map(pseudoseqs)
     df["agretopicity"] = [log_safe_ratio(wt, mt) for wt, mt in zip(df["wt_ba_score"], df["ba_score"], strict=True)]
-    return assign_splits(_attach_common_features(df), num_folds=task.dev_num_folds)
+    return _attach_common_features(df)
+
+
+def build_immunology_smoke_dataset(settings, task) -> pd.DataFrame:
+    base = exact_dedup(load_smoke_seed(settings, task))
+    write_raw_snapshot(base, settings, task, "smoke")
+    return assign_splits(materialize_immunology_features(settings, task, base), num_folds=task.dev_num_folds)
 
 
 def build_generic_pairwise_smoke_dataset(settings, task) -> pd.DataFrame:
@@ -177,6 +189,8 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
             staged_sources,
             num_folds=task.dev_num_folds,
         )
+        if task.family == "immunology":
+            full_dataset = materialize_immunology_features(settings, task, full_dataset)
         full_dataset_path = processed_dataset_path(settings, task.task_id, "full")
         full_dataset_path.parent.mkdir(parents=True, exist_ok=True)
         full_dataset.to_parquet(full_dataset_path, index=False)

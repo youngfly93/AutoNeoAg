@@ -649,7 +649,14 @@ def run_training(
     settings = load_settings(ROOT)
     task = get_task_spec(task_id)
     data_path = processed_dataset_path(settings, task.task_id, mode)
+    if not data_path.exists():
+        raise RuntimeError(
+            f"Processed dataset is missing for task={task.task_id} mode={mode}. "
+            f"Run `python prepare.py --task {task.task_id} --mode {mode}` first."
+        )
     df = load_processed_dataset(data_path)
+    if df.empty:
+        raise RuntimeError(f"Processed dataset is empty for task={task.task_id} mode={mode}.")
     device = device_for_run()
     start = time.time()
     run_dir = task_run_dir(settings, task.task_id, mode, strategy, run_id, round_id)
@@ -764,8 +771,6 @@ def main() -> None:
     parser.add_argument("--fold", type=int, default=None)
     parser.add_argument("--checkpoint-name", default=None)
     args = parser.parse_args()
-    if args.mode == "full":
-        raise RuntimeError("Full training is not enabled until full data ingest is completed.")
     metrics = run_training(args.task, args.mode, args.strategy, args.run_id, args.round_id, args.fold, args.checkpoint_name)
     print("---")
     for key, value in metrics.items():
