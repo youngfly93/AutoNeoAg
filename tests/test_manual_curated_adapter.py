@@ -188,30 +188,28 @@ def test_tumoragdb2_curated_adapter_standardizes_rows(tmp_path: Path) -> None:
     frame = pd.DataFrame(
         [
             {
-                "mutated_peptide": "SPRWYFYYL",
-                "wildtype_sequence": "SPRWYFYFL",
-                "hla_type": "HLA-B*07:02",
-                "gene_name": "PIK3CA",
-                "amino_acid_change": "E545K",
-                "study_name": "TADB-001",
-                "sample_identifier": "TADB-P001",
-                "assay_readout": "ELISpot",
-                "functional_result": "positive",
-                "pub_year": 2022,
-                "record_tier": "A",
+                "dataset": "NCI",
+                "gene": "PIK3CA",
+                "protein_coord": 545,
+                "aa_mutant": "K",
+                "aa_wt": "E",
+                "mutant_seq": "SPRWYFYYL",
+                "wt_seq": "SPRWYFYFL",
+                "mutant_best_alleles_netMHCpan": "B0702,A0201",
+                "response_type": "CD8",
+                "immunogenicity": 1,
             },
             {
-                "mutated_peptide": "KLVVVGAGG",
-                "wildtype_sequence": "KLVVVGAGD",
-                "hla_type": "HLA-A*11:01",
-                "gene_name": "KRAS",
-                "amino_acid_change": "G13D",
-                "study_name": "TADB-002",
-                "sample_identifier": "TADB-P002",
-                "assay_readout": "Multimer",
-                "functional_result": "negative",
-                "pub_year": 2021,
-                "record_tier": "B",
+                "dataset": "TESLA",
+                "gene": "KRAS",
+                "protein_coord": 13,
+                "aa_mutant": "D",
+                "aa_wt": "G",
+                "mutant_seq": "KLVVVGAGG",
+                "wt_seq": "KLVVVGAGD",
+                "mutant_best_alleles_netMHCpan": "A1101",
+                "response_type": "negative",
+                "immunogenicity": 0,
             },
         ]
     )
@@ -229,9 +227,9 @@ def test_tumoragdb2_curated_adapter_standardizes_rows(tmp_path: Path) -> None:
 
     assert len(standardized) == 2
     assert standardized["label"].tolist() == [1, 0]
-    assert standardized["study_id"].tolist() == ["TADB-001", "TADB-002"]
-    assert standardized["patient_id"].tolist() == ["TADB-P001", "TADB-P002"]
-    assert standardized["mutation_event"].tolist() == ["PIK3CA:E545K", "KRAS:G13D"]
+    assert standardized["study_id"].tolist() == ["NCI", "TESLA"]
+    assert standardized["hla"].tolist() == ["HLA-B*07:02", "HLA-A*11:01"]
+    assert standardized["mutation_event"].tolist() == ["PIK3CA:545E>K", "KRAS:13G>D"]
 
 
 def test_neo_timesplit_holdout_adapter_standardizes_rows(tmp_path: Path) -> None:

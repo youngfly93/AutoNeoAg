@@ -93,12 +93,14 @@ class TrainConfig:
     weight_decay: float = 5e-4
     epochs: int = 55
     batch_size: int = 8
+    eval_batch_size: int = 256
     seed: int = 7
     feature_blocks: tuple[str, ...] = DEFAULT_FEATURE_BLOCKS
     objective_mode: str = "bce"
     pairwise_weight: float = 0.25
     contrast_logit_weight: float = 0.30
     preference_logit_weight: float = 0.15
+    round_time_budget_sec: float | None = None
 
 
 def seed_everything(seed: int) -> None:
@@ -567,6 +569,8 @@ def fit_model(
     train_df,
     cfg: TrainConfig,
     device: torch.device,
+    *,
+    fit_time_budget_sec: float | None = None,
 ) -> tuple[NeoantigenRanker, np.ndarray, np.ndarray]:
     train_arrays = build_arrays(train_df, cfg)
     scalar_mean, scalar_std = fit_scalar_stats(train_arrays["scalars"])
@@ -585,6 +589,7 @@ def fit_model(
     model = NeoantigenRanker(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    fit_start = time.time()
     for _epoch in range(cfg.epochs):
         model.train()
         for (batch_indices,) in loader:
@@ -594,6 +599,8 @@ def fit_model(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            if fit_time_budget_sec is not None and (time.time() - fit_start) >= fit_time_budget_sec:
+                return model, scalar_mean, scalar_std
     return model, scalar_mean, scalar_std
 
 
@@ -608,13 +615,31 @@ def predict_scores(
     arrays = build_arrays(frame, cfg)
     arrays["scalars"] = apply_scalar_stats(arrays["scalars"], scalar_mean, scalar_std)
     scores, labels = [], []
+    indices = torch.arange(len(frame), dtype=torch.long)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(indices),
+        batch_size=max(1, min(cfg.eval_batch_size, len(frame))),
+        shuffle=False,
+    )
     model.eval()
     with torch.no_grad():
-        for idx in range(len(frame)):
-            batch = tensors_from_arrays(arrays, np.array([idx]), device)
-            scores.append(torch.sigmoid(model(batch)).item())
-            labels.append(float(batch["labels"].item()))
+        for (batch_indices,) in loader:
+            batch = tensors_from_arrays(arrays, batch_indices.numpy(), device)
+            batch_scores = torch.sigmoid(model(batch)).detach().cpu().numpy().astype(np.float32).tolist()
+            batch_labels = batch["labels"].detach().cpu().numpy().astype(np.float32).tolist()
+            scores.extend(batch_scores)
+            labels.extend(batch_labels)
     return np.asarray(scores, dtype=np.float32), np.asarray(labels, dtype=np.float32)
+
+
+def config_for_mode(mode: str) -> TrainConfig:
+    cfg = TrainConfig()
+    if mode == "full":
+        cfg.batch_size = 128
+        cfg.eval_batch_size = 1024
+        cfg.epochs = 100_000
+        cfg.round_time_budget_sec = 300.0
+    return cfg
 
 
 def save_checkpoint(
@@ -644,7 +669,7 @@ def run_training(
     fold: int | None,
     checkpoint_name: str | None = None,
 ) -> dict[str, float | int | str]:
-    cfg = TrainConfig()
+    cfg = config_for_mode(mode)
     seed_everything(cfg.seed)
     settings = load_settings(ROOT)
     task = get_task_spec(task_id)
@@ -666,6 +691,7 @@ def run_training(
 
     if fold is None:
         folds = dev_folds(df)
+        fit_budget_sec = cfg.round_time_budget_sec / (len(folds) + 1) if cfg.round_time_budget_sec is not None else None
         oof_scores = []
         oof_labels = []
         fold_metrics: dict[str, dict[str, float]] = {}
@@ -673,20 +699,26 @@ def run_training(
             train_df, val_df = split_frame(df, fold_id)
             if train_df.empty or val_df.empty:
                 raise RuntimeError(f"Empty split encountered for fold={fold_id}: train={len(train_df)} val={len(val_df)}")
-            model, scalar_mean, scalar_std = fit_model(train_df, cfg, device)
+            model, scalar_mean, scalar_std = fit_model(train_df, cfg, device, fit_time_budget_sec=fit_budget_sec)
             fold_scores, fold_labels = predict_scores(model, val_df, cfg, device, scalar_mean, scalar_std)
             fold_metric = metric_bundle(fold_labels, fold_scores)
             fold_metrics[str(fold_id)] = fold_metric
             oof_scores.append(fold_scores)
             oof_labels.append(fold_labels)
         full_dev = df[df["split"] == "dev"].reset_index(drop=True)
-        final_model, final_scalar_mean, final_scalar_std = fit_model(full_dev, cfg, device)
+        final_model, final_scalar_mean, final_scalar_std = fit_model(
+            full_dev,
+            cfg,
+            device,
+            fit_time_budget_sec=fit_budget_sec,
+        )
         all_scores = np.concatenate(oof_scores)
         all_labels = np.concatenate(oof_labels)
         metrics = metric_bundle(all_labels, all_scores)
         metrics["cv_num_folds"] = len(folds)
         metrics["cv_num_samples"] = int(len(all_labels))
         metrics["selection_mode"] = "grouped_cv_oof"
+        metrics["round_time_budget_sec"] = cfg.round_time_budget_sec or 0.0
         metrics_payload = {
             **metrics,
             "fold_metrics": fold_metrics,
@@ -713,12 +745,13 @@ def run_training(
         train_df, val_df = split_frame(df, fold)
         if train_df.empty or val_df.empty:
             raise RuntimeError(f"Empty split encountered for fold={fold}: train={len(train_df)} val={len(val_df)}")
-        model, scalar_mean, scalar_std = fit_model(train_df, cfg, device)
+        model, scalar_mean, scalar_std = fit_model(train_df, cfg, device, fit_time_budget_sec=cfg.round_time_budget_sec)
         val_scores, val_labels = predict_scores(model, val_df, cfg, device, scalar_mean, scalar_std)
         metrics = metric_bundle(val_labels, val_scores)
         metrics["cv_num_folds"] = 1
         metrics["cv_num_samples"] = int(len(val_labels))
         metrics["selection_mode"] = "single_fold"
+        metrics["round_time_budget_sec"] = cfg.round_time_budget_sec or 0.0
         metrics_payload = {
             **metrics,
             "feature_blocks": list(cfg.feature_blocks),

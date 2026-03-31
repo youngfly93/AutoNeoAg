@@ -54,6 +54,29 @@ def _attach_common_features(df: pd.DataFrame) -> pd.DataFrame:
     return attached
 
 
+def _filter_supported_hla_rows(settings, task, df: pd.DataFrame, report_path: Path) -> pd.DataFrame:
+    pseudoseqs = load_pseudosequences(settings, task)
+    supported = df["hla"].map(pseudoseqs).notna()
+    dropped = df.loc[~supported].copy()
+    report = {
+        "task_id": task.task_id,
+        "total_rows": int(len(df)),
+        "kept_rows": int(supported.sum()),
+        "dropped_rows": int((~supported).sum()),
+        "kept_split_counts": {str(key): int(value) for key, value in df.loc[supported, "split"].value_counts().to_dict().items()},
+        "dropped_split_counts": {str(key): int(value) for key, value in dropped["split"].value_counts().to_dict().items()},
+        "dropped_source_counts": {
+            str(key): int(value) for key, value in dropped.get("source_id", pd.Series(dtype=object)).value_counts().to_dict().items()
+        },
+        "unsupported_hla_counts": {str(key): int(value) for key, value in dropped["hla"].value_counts().to_dict().items()},
+    }
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+    filtered = df.loc[supported].reset_index(drop=True)
+    if filtered.empty:
+        raise RuntimeError(f"All rows were filtered due to unsupported HLA alleles for task {task.task_id}.")
+    return filtered
+
+
 def materialize_immunology_features(settings, task, base: pd.DataFrame) -> pd.DataFrame:
     pseudoseqs = load_pseudosequences(settings, task)
     attached = base.copy().reset_index(drop=True)
@@ -79,12 +102,14 @@ def materialize_immunology_features(settings, task, base: pd.DataFrame) -> pd.Da
     stab = netmhcstabpan_predict(settings, mut_queries["peptide_mut"].tolist(), mut_queries["hla"].tolist()).drop_duplicates(
         subset=["peptide_mut", "hla"]
     )
-    foreignness = blast_foreignness(settings, task, attached["peptide_mut"].tolist())
+    foreign_queries = attached[["peptide_mut"]].drop_duplicates().reset_index(drop=True)
+    foreignness = blast_foreignness(settings, task, foreign_queries["peptide_mut"].tolist())
+    foreignness["peptide_mut"] = foreign_queries["peptide_mut"]
 
     df = attached.merge(mut_aff, on=["peptide_mut", "hla"]).merge(wt_aff, on=["peptide_wt", "hla"]).merge(
         stab, on=["peptide_mut", "hla"]
     )
-    df = pd.concat([df.reset_index(drop=True), foreignness.reset_index(drop=True)], axis=1)
+    df = df.merge(foreignness, on="peptide_mut", how="left")
     df["agretopicity"] = [log_safe_ratio(wt, mt) for wt, mt in zip(df["wt_ba_score"], df["ba_score"], strict=True)]
     return _attach_common_features(df)
 
@@ -178,6 +203,7 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
     full_dataset_path = None
     full_split_manifest_path = None
     source_index_path = None
+    hla_support_report_path = None
     full_rows = 0
     full_splits: dict[str, int] = {}
     if standardized_frames:
@@ -190,6 +216,8 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
             num_folds=task.dev_num_folds,
         )
         if task.family == "immunology":
+            hla_support_report_path = interim_dir / "hla_support_report.json"
+            full_dataset = _filter_supported_hla_rows(settings, task, full_dataset, hla_support_report_path)
             full_dataset = materialize_immunology_features(settings, task, full_dataset)
         full_dataset_path = processed_dataset_path(settings, task.task_id, "full")
         full_dataset_path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,6 +243,7 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
         "full_dataset_path": str(full_dataset_path) if full_dataset_path is not None else "",
         "full_split_manifest_path": str(full_split_manifest_path) if full_split_manifest_path is not None else "",
         "source_index_path": str(source_index_path) if source_index_path is not None else "",
+        "hla_support_report_path": str(hla_support_report_path) if hla_support_report_path is not None else "",
         "full_rows": full_rows,
         "full_splits": full_splits,
         "train_candidate_sources": staged_sources.loc[staged_sources["split_role"] == "train_candidate", "source_id"].tolist(),
@@ -234,6 +263,7 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
         "full_dataset_path": full_dataset_path,
         "full_split_manifest_path": full_split_manifest_path,
         "source_index_path": source_index_path,
+        "hla_support_report_path": hla_support_report_path,
         "full_rows": full_rows,
         "full_splits": full_splits,
     }

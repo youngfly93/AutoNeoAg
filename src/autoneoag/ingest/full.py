@@ -44,6 +44,7 @@ ALIAS_GROUPS = {
         "mutant_peptide",
         "mutated_peptide",
         "mutant_sequence",
+        "mutant_seq",
         "neo_peptide",
         "epitope",
         "peptide",
@@ -51,19 +52,60 @@ ALIAS_GROUPS = {
     "peptide_wt": [
         "peptide_wt",
         "wt_peptide",
+        "wt peptide",
+        "wt_seq",
         "wildtype_peptide",
         "wildtype_sequence",
         "reference_peptide",
         "wt_epitope",
         "reference_sequence",
     ],
-    "hla": ["hla", "hla_allele", "hla_type", "mhc", "allele", "allele_name", "mhc_allele"],
-    "gene": ["gene", "gene_symbol", "gene_name", "antigen_gene"],
+    "hla": [
+        "hla",
+        "hla_allele",
+        "hla_type",
+        "mhc",
+        "allele",
+        "allele_name",
+        "mhc_allele",
+        "mhc_allele_name",
+        "mutant_best_alleles_netmhcpan",
+        "mutant_best_alleles",
+    ],
+    "gene": ["gene", "gene_symbol", "gene_name", "genesymbol", "antigen_gene"],
     "aa_change": ["aa_change", "amino_acid_change", "protein_change", "mutation", "variant", "variant_name"],
-    "study_id": ["study_id", "study", "study_name", "cohort_id", "study_accession", "reference_id"],
-    "patient_id": ["patient_id", "patient", "patient_or_sample", "sample_id", "sample_identifier", "subject_id"],
-    "assay_type": ["assay_type", "assay", "assay_readout", "readout", "assay_group", "method"],
-    "label": ["label", "functional_result", "immunogenicity", "is_positive", "immunogenic", "response", "assay_result", "qualitative_measure"],
+    "study_id": ["study_id", "study", "study_name", "dataset", "cohort_id", "study_accession", "reference_id", "reference"],
+    "patient_id": [
+        "patient_id",
+        "patient",
+        "patient_or_sample",
+        "sample_id",
+        "sample_identifier",
+        "sample_tissue",
+        "subject_id",
+    ],
+    "assay_type": [
+        "assay_type",
+        "assay",
+        "assay_readout",
+        "lymphocyte_stimulation",
+        "readout",
+        "response_type",
+        "qualitative_measure\\response_type",
+        "assay_group",
+        "method",
+    ],
+    "label": [
+        "label",
+        "functional_result",
+        "immunogenicity",
+        "is_positive",
+        "immunogenic",
+        "response",
+        "qualitative_measure\\response_type",
+        "assay_result",
+        "qualitative_measure",
+    ],
     "label_tier": ["label_tier", "record_tier", "tier"],
     "source_name": ["source_name", "source"],
     "source_year": ["source_year", "pub_year", "year"],
@@ -86,7 +128,11 @@ def _list_tabular_files(path: Path) -> list[Path]:
         and not file_path.name.startswith(".")
         and file_path.suffix.lower() in {".tsv", ".csv", ".xlsx", ".xls"}
     )
-    return files
+    real_curated = [file_path for file_path in files if file_path.name.startswith("real_")]
+    if real_curated:
+        return real_curated
+    non_template = [file_path for file_path in files if not file_path.name.startswith("template_")]
+    return non_template
 
 
 def _read_tabular_file(path: Path) -> pd.DataFrame:
@@ -103,13 +149,53 @@ def _read_tabular_file(path: Path) -> pd.DataFrame:
 def _canonicalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
     renamed = frame.copy()
     renamed.columns = [str(column).strip() for column in renamed.columns]
+    lookup = {str(column).strip().lower(): column for column in renamed.columns}
     output = pd.DataFrame(index=renamed.index)
     for canonical, aliases in ALIAS_GROUPS.items():
+        series = None
         for alias in aliases:
-            if alias in renamed.columns:
-                output[canonical] = renamed[alias]
-                break
+            column = lookup.get(alias.lower())
+            if column is not None:
+                candidate = renamed[column]
+                series = candidate if series is None else series.fillna(candidate)
+        if series is not None:
+            output[canonical] = series
     return output
+
+
+def _source_column(frame: pd.DataFrame, *aliases: str) -> pd.Series | None:
+    lookup = {str(column).strip().lower(): column for column in frame.columns}
+    for alias in aliases:
+        column = lookup.get(alias.lower())
+        if column is not None:
+            return frame[column]
+    return None
+
+
+def _normalize_hla_allele(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    token = str(value).strip().split(",")[0].split(";")[0].strip().upper()
+    token = token.replace("HLA-", "").replace("*", "").replace(":", "")
+    if len(token) >= 5 and token[0] in {"A", "B", "C"} and token[1:].isdigit():
+        family = token[0]
+        digits = token[1:]
+        if len(digits) == 2:
+            digits = digits + "01"
+        if len(digits) >= 4:
+            return f"HLA-{family}*{digits[:2]}:{digits[2:4]}"
+    if str(value).strip().upper().startswith("HLA-"):
+        raw = str(value).strip().upper()
+        if "*" in raw and ":" in raw:
+            return raw
+        if "*" in raw:
+            prefix, suffix = raw.split("*", 1)
+            suffix = suffix.replace(":", "")
+            if len(suffix) == 2:
+                suffix = suffix + "01"
+            if len(suffix) >= 4:
+                return f"{prefix}*{suffix[:2]}:{suffix[2:4]}"
+    return str(value).strip()
 
 
 def _normalize_bool(value: object, default: int = 0) -> int:
@@ -147,6 +233,9 @@ def _normalize_functional_immunology(
     default_assay: str,
     default_tier: str,
 ) -> pd.DataFrame:
+    standardized["peptide_mut"] = standardized.get("peptide_mut", pd.Series([""] * len(standardized))).astype(str).str.upper()
+    standardized["peptide_wt"] = standardized.get("peptide_wt", pd.Series([""] * len(standardized))).astype(str).str.upper()
+    standardized["hla"] = standardized.get("hla", pd.Series([""] * len(standardized))).map(_normalize_hla_allele)
     standardized["patient_id"] = standardized.get("patient_id", pd.Series([""] * len(standardized)))
     standardized["assay_type"] = standardized.get("assay_type", pd.Series([default_assay] * len(standardized)))
     standardized["label_tier"] = standardized.get("label_tier", pd.Series([default_tier] * len(standardized)))
@@ -164,6 +253,25 @@ def _normalize_functional_immunology(
         if column not in standardized.columns:
             standardized[column] = ""
     standardized = standardized[CANONICAL_COLUMNS].copy()
+    string_columns = [
+        "peptide_mut",
+        "peptide_wt",
+        "hla",
+        "gene",
+        "aa_change",
+        "study_id",
+        "patient_id",
+        "assay_type",
+        "label_tier",
+        "source_name",
+    ]
+    for column in string_columns:
+        standardized[column] = standardized[column].fillna("").astype(str)
+    standardized = standardized[
+        standardized["peptide_mut"].astype(str).str.len().gt(0)
+        & standardized["peptide_wt"].astype(str).str.len().gt(0)
+        & standardized["hla"].astype(str).str.startswith("HLA-")
+    ].reset_index(drop=True)
     standardized["source_year"] = standardized["source_year"].astype(int)
     standardized["patient_id"] = standardized["patient_id"].fillna("").astype(str)
     standardized["assay_type"] = standardized["assay_type"].fillna(default_assay).astype(str)
@@ -206,6 +314,26 @@ def standardize_iedb_functional_immunology(frame: pd.DataFrame, source_row: dict
 
 def standardize_tumoragdb2_curated(frame: pd.DataFrame, source_row: dict[str, object]) -> pd.DataFrame:
     standardized = _canonicalize_columns(frame)
+    aa_wt = _source_column(frame, "aa_wt")
+    aa_mut = _source_column(frame, "aa_mutant")
+    protein_coord = _source_column(frame, "protein_coord")
+    if "aa_change" not in standardized.columns and aa_wt is not None and aa_mut is not None and protein_coord is not None:
+        standardized["aa_change"] = (
+            protein_coord.fillna("").astype(str)
+            + aa_wt.fillna("").astype(str)
+            + ">"
+            + aa_mut.fillna("").astype(str)
+        )
+    if "peptide_wt" not in standardized.columns:
+        standardized["peptide_wt"] = standardized.get("peptide_mut", pd.Series([""] * len(standardized)))
+    standardized["hla"] = standardized.get("hla", pd.Series([""] * len(standardized))).map(_normalize_hla_allele)
+    standardized["peptide_mut"] = standardized.get("peptide_mut", pd.Series([""] * len(standardized))).astype(str).str.upper()
+    standardized["peptide_wt"] = standardized.get("peptide_wt", pd.Series([""] * len(standardized))).astype(str).str.upper()
+    standardized = standardized[
+        standardized["peptide_mut"].str.len().between(8, 11)
+        & standardized["peptide_wt"].str.len().between(8, 11)
+        & standardized["hla"].astype(str).str.startswith("HLA-")
+    ].reset_index(drop=True)
     required = [
         "peptide_mut",
         "peptide_wt",
