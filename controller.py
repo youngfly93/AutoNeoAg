@@ -118,7 +118,33 @@ def run_experiment(task_id: str, mode: str, strategy: str, run_id: int, rounds: 
             if round_id > 1:
                 preexisting_dirty = set(changed_files(ROOT))
                 before_snapshot = snapshot_files(ROOT, allowed_files)
-                proposal = proposal_for_strategy(settings, task.task_id, strategy, round_id, "\n".join(summary_lines[-10:]))
+                try:
+                    proposal = proposal_for_strategy(settings, task.task_id, strategy, round_id, "\n".join(summary_lines[-10:]))
+                except RuntimeError as exc:
+                    failure_message = str(exc).strip().replace("\t", " ").replace("\n", " | ")
+                    append_result(
+                        settings.results_tsv,
+                        task_id=task.task_id,
+                        strategy=strategy,
+                        run_id=run_id,
+                        round_id=round_id,
+                        commit=best_commit,
+                        dev_score=best_score if best_score > float("-inf") else None,
+                        confirm_score=None,
+                        blind_score=None,
+                        status="discard",
+                        failure_type="worker_failed",
+                        training_seconds=None,
+                        lines_changed=0,
+                        description=failure_message,
+                    )
+                    summary_lines.append(
+                        json.dumps(
+                            {"round": round_id, "status": "discard", "failure": "worker_failed", "message": failure_message},
+                            ensure_ascii=False,
+                        )
+                    )
+                    break
                 description = proposal["summary"]
                 current_dirty = set(changed_files(ROOT))
                 changed_allowed = sorted(
