@@ -19,6 +19,7 @@ from autoneoag.config import ensure_directories, load_settings, require_env
 from autoneoag.features.biochem import aromaticity, delta_residue_fraction, gravy, log_safe_ratio, non_polar_ratio
 from autoneoag.features.dtu import netmhcpan_predict, netmhcstabpan_predict
 from autoneoag.features.foreignness import blast_foreignness
+from autoneoag.ingest.full import run_source_adapter
 from autoneoag.manifests import load_manifest_bundle, resolve_manifest_path, write_manifest_summary
 from autoneoag.features.pseudoseq import load_pseudosequences
 from autoneoag.ingest.public import load_smoke_seed, write_raw_snapshot
@@ -141,6 +142,32 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
 
     blocked_sources = staged_sources.loc[staged_sources["ingest_status"] != "implemented", "source_id"].tolist()
     missing_raw_sources = staged_sources.loc[~staged_sources["raw_exists"], "source_id"].tolist()
+    standardized_dir = interim_dir / "sources"
+    standardized_dir.mkdir(parents=True, exist_ok=True)
+    standardized_outputs: list[str] = []
+    adapter_failures: dict[str, str] = {}
+    standardized_frames: list[pd.DataFrame] = []
+    for row in staged_sources.to_dict(orient="records"):
+        if row["ingest_status"] != "implemented":
+            continue
+        if not row["raw_exists"]:
+            continue
+        try:
+            standardized = run_source_adapter(settings, row)
+        except Exception as exc:
+            adapter_failures[str(row["source_id"])] = str(exc)
+            continue
+        output_path = standardized_dir / f"{row['source_id']}.parquet"
+        standardized.to_parquet(output_path, index=False)
+        standardized_outputs.append(str(output_path))
+        standardized_frames.append(standardized)
+
+    combined_path = None
+    if standardized_frames:
+        combined = pd.concat(standardized_frames, ignore_index=True)
+        combined_path = standardized_dir / "standardized_sources.parquet"
+        combined.to_parquet(combined_path, index=False)
+
     plan_payload = {
         "task_id": task.task_id,
         "status": "phase1_manifest_validated",
@@ -150,6 +177,9 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
         "implemented_sources": staged_sources.loc[staged_sources["ingest_status"] == "implemented", "source_id"].tolist(),
         "blocked_sources": blocked_sources,
         "missing_raw_sources": missing_raw_sources,
+        "standardized_outputs": standardized_outputs,
+        "adapter_failures": adapter_failures,
+        "combined_standardized_path": str(combined_path) if combined_path is not None else "",
         "train_candidate_sources": staged_sources.loc[staged_sources["split_role"] == "train_candidate", "source_id"].tolist(),
         "blind_only_sources": staged_sources.loc[staged_sources["split_role"] == "blind_only", "source_id"].tolist(),
     }
@@ -162,6 +192,8 @@ def stage_full_preparation_plan(settings, task) -> dict[str, object]:
         "plan_path": plan_path,
         "blocked_sources": blocked_sources,
         "missing_raw_sources": missing_raw_sources,
+        "standardized_outputs": standardized_outputs,
+        "adapter_failures": adapter_failures,
     }
 
 
@@ -184,6 +216,8 @@ def main() -> None:
         print(f"full_prepare_plan_path: {plan['plan_path']}")
         print(f"blocked_sources: {plan['blocked_sources']}")
         print(f"missing_raw_sources: {plan['missing_raw_sources']}")
+        print(f"standardized_outputs: {plan['standardized_outputs']}")
+        print(f"adapter_failures: {plan['adapter_failures']}")
         return
     df = build_dataset(settings, task, args.mode)
     output_path = processed_dataset_path(settings, task.task_id, args.mode)
