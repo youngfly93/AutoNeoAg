@@ -93,6 +93,7 @@ class TrainConfig:
     objective_mode: str = "bce"
     pairwise_weight: float = 0.25
     contrast_logit_weight: float = 0.30
+    preference_logit_weight: float = 0.15
 
 
 def seed_everything(seed: int) -> None:
@@ -316,6 +317,24 @@ class ContrastHead(nn.Module):
         return hidden, self.logit(hidden).squeeze(1)
 
 
+class AllelePreferenceHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.logit = nn.Linear(hidden_dim, 1)
+
+    def forward(self, pair_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.net(pair_inputs)
+        return hidden, self.logit(hidden).squeeze(1)
+
+
 class ContrastConditioner(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -372,7 +391,9 @@ class NeoantigenRanker(nn.Module):
         self.scalar_tower = ScalarTower(scalar_input_dim(cfg), cfg.scalar_hidden_dim, cfg.dropout)
 
         seq_width = cfg.seq_hidden_dim * 2
-        contrast_input_dim = seq_width * 7
+        preference_input_dim = seq_width * 4
+        self.preference_head = AllelePreferenceHead(preference_input_dim, cfg.contrast_hidden_dim, cfg.dropout)
+        contrast_input_dim = seq_width * 7 + cfg.contrast_hidden_dim
         self.contrast_head = ContrastHead(contrast_input_dim, cfg.contrast_hidden_dim, cfg.dropout)
         contrast_scalar_dim = sum(
             len(FEATURE_BLOCK_COLUMNS[block_name])
@@ -413,6 +434,12 @@ class NeoantigenRanker(nn.Module):
         average_peptide = 0.5 * (mut + wt)
         mut_hla = mut * hla
         wt_hla = wt * hla
+        mut_preference_inputs = torch.cat([mut, hla, mut_hla, torch.abs(mut - hla)], dim=1)
+        wt_preference_inputs = torch.cat([wt, hla, wt_hla, torch.abs(wt - hla)], dim=1)
+        mut_preference_hidden, mut_preference_logit = self.preference_head(mut_preference_inputs)
+        wt_preference_hidden, wt_preference_logit = self.preference_head(wt_preference_inputs)
+        preference_delta_hidden = mut_preference_hidden - wt_preference_hidden
+        preference_delta_logit = mut_preference_logit - wt_preference_logit
         contrast_inputs = torch.cat(
             [
                 mut - wt,
@@ -422,6 +449,7 @@ class NeoantigenRanker(nn.Module):
                 mut_hla - wt_hla,
                 (mut - wt) * hla,
                 delta * hla,
+                preference_delta_hidden,
             ],
             dim=1,
         )
@@ -448,7 +476,11 @@ class NeoantigenRanker(nn.Module):
         conditioning = torch.cat([scalars, contrast_hidden], dim=1)
         fused = self.fusion(sequence_features, conditioning)
         main_logit = self.head(torch.cat([fused, conditioning], dim=1)).squeeze(1)
-        return main_logit + self.cfg.contrast_logit_weight * contrast_logit
+        return (
+            main_logit
+            + self.cfg.contrast_logit_weight * contrast_logit
+            + self.cfg.preference_logit_weight * preference_delta_logit
+        )
 
 
 def pairwise_ranking_loss(logits: torch.Tensor, labels: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
