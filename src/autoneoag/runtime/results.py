@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 
@@ -16,6 +17,14 @@ def ensure_results_file(path: Path) -> None:
 
 def reset_results_file(path: Path) -> None:
     path.write_text(HEADER)
+
+
+def load_results(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open() as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        return [dict(row) for row in reader]
 
 
 def _format_value(value: object) -> str:

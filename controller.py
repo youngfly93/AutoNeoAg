@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +29,7 @@ from autoneoag.runtime.git_ops import (
     reset_hard,
 )
 from autoneoag.runtime.random_worker import run_random_worker
-from autoneoag.runtime.results import append_result, reset_results_file
+from autoneoag.runtime.results import append_result, load_results, reset_results_file
 from autoneoag.tasks import get_task_spec, list_task_ids, log_dir, report_path, run_dir as task_run_dir
 
 
@@ -78,7 +79,69 @@ def snapshot_files(root: Path, paths: set[str]) -> dict[str, str | None]:
     return snapshot
 
 
-def run_experiment(task_id: str, mode: str, strategy: str, run_id: int, rounds: int, reset_results: bool = False) -> None:
+@dataclass
+class ResumeState:
+    start_round: int
+    best_commit: str
+    best_score: float
+    best_checkpoint: str
+    best_round: int
+    summary_lines: list[str]
+
+
+def _result_float(value: str) -> float | None:
+    if value in {"", None}:
+        return None
+    return float(value)
+
+
+def load_resume_state(settings, task_id: str, mode: str, strategy: str, run_id: int) -> ResumeState | None:
+    rows = [
+        row
+        for row in load_results(settings.results_tsv)
+        if row["task_id"] == task_id and row["strategy"] == strategy and int(row["run_id"]) == run_id
+    ]
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda row: int(row["round_id"]))
+    keep_rows = [row for row in rows if row["status"] == "keep" and row["commit"]]
+    if not keep_rows:
+        return None
+    best_row = keep_rows[-1]
+    best_round = int(best_row["round_id"])
+    best_checkpoint = str(task_run_dir(settings, task_id, mode, strategy, run_id, best_round) / f"round_{best_round:02d}.pt")
+    summary_lines = [
+        json.dumps(
+            {
+                "round": int(row["round_id"]),
+                "val_score": _result_float(row["dev_score"]),
+                "status": row["status"],
+                "failure": row["failure_type"] or None,
+                "summary": row["description"],
+            },
+            ensure_ascii=False,
+        )
+        for row in rows
+    ]
+    return ResumeState(
+        start_round=int(rows[-1]["round_id"]) + 1,
+        best_commit=best_row["commit"],
+        best_score=float(best_row["dev_score"]),
+        best_checkpoint=best_checkpoint,
+        best_round=best_round,
+        summary_lines=summary_lines,
+    )
+
+
+def run_experiment(
+    task_id: str,
+    mode: str,
+    strategy: str,
+    run_id: int,
+    rounds: int,
+    reset_results: bool = False,
+    resume: bool = False,
+) -> None:
     task = get_task_spec(task_id)
     settings = load_settings(ROOT)
     ensure_directories(settings)
@@ -96,14 +159,16 @@ def run_experiment(task_id: str, mode: str, strategy: str, run_id: int, rounds: 
     branch_name = f"autoneoag/{task.task_id}/{strategy}/run_{run_id:02d}"
     ensure_branch(ROOT, branch_name)
     try:
-        best_commit = current_commit(ROOT)
-        best_score = float("-inf")
-        best_checkpoint = ""
-        best_round = 0
-        summary_lines = [prepare_stdout.strip()]
+        resume_state = load_resume_state(settings, task.task_id, mode, strategy, run_id) if resume else None
+        best_commit = resume_state.best_commit if resume_state is not None else current_commit(ROOT)
+        best_score = resume_state.best_score if resume_state is not None else float("-inf")
+        best_checkpoint = resume_state.best_checkpoint if resume_state is not None else ""
+        best_round = resume_state.best_round if resume_state is not None else 0
+        summary_lines = [prepare_stdout.strip(), *(resume_state.summary_lines if resume_state is not None else [])]
+        start_round = resume_state.start_round if resume_state is not None else 1
         allowed_files = set(allowed_edit_scope(strategy)) if strategy != "random" else {"train.py"}
 
-        for round_id in range(1, rounds + 1):
+        for round_id in range(start_round, rounds + 1):
             description = "baseline"
             proposal = {
                 "hypothesis": "baseline",
@@ -289,7 +354,15 @@ def run_experiment(task_id: str, mode: str, strategy: str, run_id: int, rounds: 
         checkout_branch(ROOT, base_branch)
 
 
-def run_matrix(tasks: list[str], mode: str, strategies: list[str], runs: int, rounds: int, reset_results: bool) -> None:
+def run_matrix(
+    tasks: list[str],
+    mode: str,
+    strategies: list[str],
+    runs: int,
+    rounds: int,
+    reset_results: bool,
+    resume: bool = False,
+) -> None:
     first = True
     for task_id in tasks:
         for strategy in strategies:
@@ -301,6 +374,7 @@ def run_matrix(tasks: list[str], mode: str, strategies: list[str], runs: int, ro
                     run_id=run_id,
                     rounds=rounds,
                     reset_results=reset_results and first,
+                    resume=resume,
                 )
                 first = False
 
@@ -316,6 +390,7 @@ def main() -> None:
     run_parser.add_argument("--run-id", type=int, default=1)
     run_parser.add_argument("--rounds", type=int, default=10)
     run_parser.add_argument("--reset-results", action="store_true")
+    run_parser.add_argument("--resume", action="store_true")
 
     matrix_parser = subparsers.add_parser("matrix")
     matrix_parser.add_argument("--tasks", nargs="+", choices=list_task_ids(), required=True)
@@ -324,15 +399,16 @@ def main() -> None:
     matrix_parser.add_argument("--runs", type=int, default=1)
     matrix_parser.add_argument("--rounds", type=int, default=10)
     matrix_parser.add_argument("--reset-results", action="store_true")
+    matrix_parser.add_argument("--resume", action="store_true")
 
     smoke_parser = subparsers.add_parser("smoke")
     smoke_parser.add_argument("--rounds", type=int, default=10)
 
     args = parser.parse_args()
     if args.command == "run":
-        run_experiment(args.task, args.mode, args.strategy, args.run_id, args.rounds, args.reset_results)
+        run_experiment(args.task, args.mode, args.strategy, args.run_id, args.rounds, args.reset_results, args.resume)
     elif args.command == "matrix":
-        run_matrix(args.tasks, args.mode, args.strategies, args.runs, args.rounds, args.reset_results)
+        run_matrix(args.tasks, args.mode, args.strategies, args.runs, args.rounds, args.reset_results, args.resume)
     elif args.command == "smoke":
         run_experiment("neoantigen", "smoke", "constrained", 1, args.rounds, True)
 

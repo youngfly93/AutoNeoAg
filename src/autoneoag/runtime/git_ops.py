@@ -8,6 +8,10 @@ def _run(args: list[str], root: Path) -> str:
     return subprocess.run(args, cwd=root, check=True, capture_output=True, text=True).stdout.strip()
 
 
+def _check(args: list[str], root: Path) -> bool:
+    return subprocess.run(args, cwd=root, capture_output=True, text=True).returncode == 0
+
+
 def has_commits(root: Path) -> bool:
     try:
         _run(["git", "rev-parse", "HEAD"], root)
@@ -25,7 +29,10 @@ def current_branch(root: Path) -> str:
 
 
 def ensure_branch(root: Path, name: str) -> None:
-    _run(["git", "checkout", "-B", name], root)
+    if _check(["git", "rev-parse", "--verify", name], root):
+        _run(["git", "checkout", name], root)
+    else:
+        _run(["git", "checkout", "-b", name], root)
 
 
 def checkout_branch(root: Path, name: str) -> None:
