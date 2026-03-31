@@ -1,0 +1,5 @@
+selector_id,task_id,lockbox_name,selector_type,selector_value,reason,allowed_for_training,allowed_for_confirm,allowed_for_blind,notes
+neo_lockbox_tesla_source,neoantigen,tesla_lockbox,source_id,neo_tesla,Official external benchmark must remain blind,0,0,1,Expanded to sample-level manifest in Phase 2 once ingest is implemented.
+neo_lockbox_2024plus_source,neoantigen,timesplit_2024plus_lockbox,source_id,neo_2024plus,Out-of-time evaluation must remain blind,0,0,1,Expanded to sample-level manifest in Phase 2 once ingest is implemented.
+neo_exclude_simulated_main,neoantigen,main_task_exclusion,source_id,neo_simulated,Weak labels are excluded from main ranking claim,0,0,0,May later be allowed in auxiliary pretraining only.
+neo_exclude_mouse_main,neoantigen,main_task_exclusion,source_id,neo_mouse,Mouse-only data is excluded from the main human framework claim,0,0,0,Retained only as a documented exclusion rule.

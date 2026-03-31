@@ -1,0 +1,5 @@
+selector_id,task_id,lockbox_name,selector_type,selector_value,reason,allowed_for_training,allowed_for_confirm,allowed_for_blind,notes
+immuno_lockbox_external_study,hla_immunogenicity,study_external_lockbox,source_id,immuno_external_study,External study holdout must remain blind,0,0,1,Expanded to sample-level manifest in Phase 3 once ingest is implemented.
+immuno_lockbox_2024plus,hla_immunogenicity,timesplit_2024plus_lockbox,source_id,immuno_2024plus,Out-of-time evaluation must remain blind,0,0,1,Expanded to sample-level manifest in Phase 3 once ingest is implemented.
+immuno_exclude_binding_only,hla_immunogenicity,main_task_exclusion,source_id,immuno_binding_only,Binding-only endpoints are excluded from the main functional immunogenicity claim,0,0,0,May later be reused only as auxiliary information after the main task is stable.
+immuno_exclude_mouse,hla_immunogenicity,main_task_exclusion,source_id,immuno_mouse,Mouse-only evidence is excluded from the main human framework claim,0,0,0,Retained only as a documented exclusion rule.

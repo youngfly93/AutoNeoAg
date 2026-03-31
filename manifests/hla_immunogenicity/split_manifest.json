@@ -1,0 +1,48 @@
+{
+  "task_id": "hla_immunogenicity",
+  "status": "phase1_draft",
+  "primary_target": "human_hla_i_functional_immunogenicity_ranking",
+  "dev_num_folds": 4,
+  "dedup": {
+    "level": "exact_and_study_aware",
+    "keys": [
+      "peptide_mut",
+      "peptide_wt",
+      "hla",
+      "label"
+    ],
+    "notes": "Exact duplicate rows are removed first; study-aware grouping is applied before fold assignment."
+  },
+  "grouping": {
+    "study_aware": true,
+    "patient_aware_when_available": true,
+    "similarity_aware": true,
+    "hla_aware": true
+  },
+  "stratification": [
+    "label",
+    "peptide_length",
+    "hla_supertype"
+  ],
+  "confirm_policy": {
+    "split_name": "confirm",
+    "source_separation": "must remain inside training-eligible source families",
+    "study_overlap": "avoid when possible"
+  },
+  "blind_policy": {
+    "split_name": "blind",
+    "lockboxes": [
+      "study_external_lockbox",
+      "timesplit_2024plus_lockbox"
+    ]
+  },
+  "challenge_splits": [
+    "leave-study-out",
+    "leave-hla-supertype-out"
+  ],
+  "notes": [
+    "Binding-only source families are not allowed to define the main endpoint.",
+    "External study holdout remains blind to the agent.",
+    "Time-split holdout remains blind to the agent."
+  ]
+}

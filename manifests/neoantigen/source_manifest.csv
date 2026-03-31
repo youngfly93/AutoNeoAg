@@ -1,0 +1,8 @@
+source_id,source_name,task_id,source_type,download_method,license_or_access,raw_file_path,label_strength,is_train_eligible,is_confirm_eligible,is_blind_only,notes
+neo_tumoragdb2_core,TumorAgDB2.0 curated human HLA-I subset,neoantigen,public_db,planned_adapter,public,data/raw/neoantigen/tumoragdb2/,tier_a_or_b,1,1,0,Primary candidate source for full ingest after strict filtering and TESLA removal.
+neo_iedb_functional,IEDB human HLA-I neoantigen functional subset,neoantigen,public_db,planned_adapter,public,data/raw/neoantigen/iedb_functional/,tier_a,1,1,0,Only functional evidence rows are eligible for main training.
+neo_literature_curated,Manual curated human neoantigen literature set,neoantigen,manual_curated,manual_import,review_required,data/raw/neoantigen/literature_curated/,tier_a_or_b,1,1,0,Used only after provenance and assay mapping are explicit.
+neo_tesla,TESLA benchmark cohort,neoantigen,benchmark_lockbox,manual_import,public_or_review_required,data/raw/neoantigen/tesla/,external_blind,0,0,1,Reserved as external lockbox and never used for development.
+neo_2024plus,2024-2025 out-of-time literature holdout,neoantigen,time_lockbox,manual_curated,review_required,data/raw/neoantigen/2024plus_holdout/,external_blind,0,0,1,Reserved for time-split blind evaluation.
+neo_simulated,Simulated positives and negatives,neoantigen,weak_label,planned_adapter,review_required,data/raw/neoantigen/simulated/,tier_c,0,0,0,May be used only for auxiliary pretraining; excluded from main conclusion.
+neo_mouse,Mouse-validated neoantigen records,neoantigen,weak_label,planned_adapter,review_required,data/raw/neoantigen/mouse/,tier_c,0,0,0,Excluded from main human ranking claim.
