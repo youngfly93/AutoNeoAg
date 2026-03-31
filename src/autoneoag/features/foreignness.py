@@ -7,13 +7,16 @@ from pathlib import Path
 import pandas as pd
 
 from autoneoag.config import Settings
+from autoneoag.tasks import TaskSpec, resource_path
 
 
-def ensure_blast_db(settings: Settings) -> Path:
-    ref_path = settings.root / "src" / "autoneoag" / "resources" / settings.smoke_reference_resource
+def ensure_blast_db(settings: Settings, task: TaskSpec) -> Path:
+    if task.reference_resource is None:
+        raise RuntimeError(f"Task {task.task_id} does not define a foreignness reference resource.")
+    ref_path = resource_path(settings, task.reference_resource)
     db_dir = settings.artifacts_cache / "blast"
     db_dir.mkdir(parents=True, exist_ok=True)
-    db_prefix = db_dir / "smoke_human_reference"
+    db_prefix = db_dir / f"{task.task_id}_reference"
     if not (db_prefix.with_suffix(".pin").exists() or db_prefix.with_suffix(".psq").exists()):
         subprocess.run(
             [
@@ -32,8 +35,8 @@ def ensure_blast_db(settings: Settings) -> Path:
     return db_prefix
 
 
-def blast_foreignness(settings: Settings, peptides: list[str]) -> pd.DataFrame:
-    db_prefix = ensure_blast_db(settings)
+def blast_foreignness(settings: Settings, task: TaskSpec, peptides: list[str]) -> pd.DataFrame:
+    db_prefix = ensure_blast_db(settings, task)
     with tempfile.TemporaryDirectory() as tmpdir:
         query = Path(tmpdir) / "peptides.faa"
         with query.open("w") as handle:
@@ -77,4 +80,3 @@ def blast_foreignness(settings: Settings, peptides: list[str]) -> pd.DataFrame:
                 }
             )
         return pd.DataFrame(rows)
-

@@ -8,11 +8,29 @@ from pathlib import Path
 from autoneoag.config import Settings
 
 
-def run_codex_worker(settings: Settings, round_id: int, root: Path, summary: str) -> dict[str, object]:
+def allowed_edit_scope(strategy: str) -> list[str]:
+    if strategy == "constrained":
+        return ["train.py"]
+    if strategy == "unconstrained":
+        return ["train.py", "program.md"]
+    raise KeyError(f"Unsupported codex strategy: {strategy}")
+
+
+def run_codex_worker(
+    settings: Settings,
+    *,
+    task_id: str,
+    strategy: str,
+    round_id: int,
+    root: Path,
+    summary: str,
+) -> dict[str, object]:
     schema = root / "schemas" / "codex_worker_output.schema.json"
+    scope = allowed_edit_scope(strategy)
+    scope_text = ", ".join(scope)
     prompt = f"""
-You are proposing experiment round {round_id} for AutoNeoAg.
-Read program.md and train.py, then modify only train.py.
+You are proposing experiment round {round_id} for AutoNeoAg task {task_id}.
+Read program.md and train.py, then modify only these files if necessary: {scope_text}.
 Do not touch any other file.
 Keep the change small and compatible with MPS/CPU.
 Prefer higher-level edits in scalar feature blocks, WT-vs-Mut contrast heads, pair/group ranking objectives, and HLA-conditioned interaction structure.

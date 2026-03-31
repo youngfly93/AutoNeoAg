@@ -38,10 +38,38 @@ def commit_all(root: Path, message: str) -> str:
     return current_commit(root)
 
 
+def commit_paths(root: Path, paths: list[str], message: str) -> str:
+    if not paths:
+        raise RuntimeError("commit_paths requires at least one path.")
+    _run(["git", "add", "--", *paths], root)
+    _run(["git", "commit", "-m", message], root)
+    return current_commit(root)
+
+
 def reset_hard(root: Path, commit: str) -> None:
     _run(["git", "reset", "--hard", commit], root)
 
 
-def changed_files(root: Path) -> list[str]:
-    out = _run(["git", "diff", "--name-only"], root)
+def changed_files(root: Path, paths: list[str] | None = None) -> list[str]:
+    args = ["git", "diff", "--name-only"]
+    if paths:
+        args.extend(["--", *paths])
+    out = _run(args, root)
     return [line for line in out.splitlines() if line]
+
+
+def changed_line_count(root: Path, paths: list[str] | None = None) -> int:
+    args = ["git", "diff", "--numstat"]
+    if paths:
+        args.extend(["--", *paths])
+    out = _run(args, root)
+    total = 0
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        added, deleted, _path = line.split("\t", 2)
+        if added.isdigit():
+            total += int(added)
+        if deleted.isdigit():
+            total += int(deleted)
+    return total

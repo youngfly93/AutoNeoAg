@@ -8,6 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from autoneoag.bootstrap import ensure_project_python
+
+ensure_project_python(ROOT)
+
 import pandas as pd
 
 from autoneoag.config import ensure_directories, load_settings, require_env
@@ -17,12 +21,13 @@ from autoneoag.features.foreignness import blast_foreignness
 from autoneoag.features.pseudoseq import load_pseudosequences
 from autoneoag.ingest.public import load_smoke_seed, write_raw_snapshot
 from autoneoag.splits.pipeline import assign_splits, exact_dedup, write_manifest
+from autoneoag.tasks import get_task_spec, list_task_ids, processed_dataset_path, split_manifest_path
 
 
-def _verify_hard_requirements(settings, mode: str) -> None:
-    if not settings.netmhcpan_home.exists():
+def _verify_hard_requirements(settings, task, mode: str) -> None:
+    if task.require_dtu and not settings.netmhcpan_home.exists():
         raise RuntimeError(f"Missing NetMHCpan install at {settings.netmhcpan_home}")
-    if not settings.netmhcstabpan_home.exists():
+    if task.require_dtu and not settings.netmhcstabpan_home.exists():
         raise RuntimeError(f"Missing NetMHCstabpan install at {settings.netmhcstabpan_home}")
     if mode == "full":
         require_env("SYNAPSE_USERNAME")
@@ -30,10 +35,22 @@ def _verify_hard_requirements(settings, mode: str) -> None:
             raise RuntimeError("Full mode requires Synapse credentials via ~/.synapseConfig or SYNAPSE_API_TOKEN")
 
 
-def build_smoke_dataset(settings) -> pd.DataFrame:
-    base = exact_dedup(load_smoke_seed(settings))
-    write_raw_snapshot(base, settings.data_raw, "smoke")
-    pseudoseqs = load_pseudosequences(settings)
+def _attach_common_features(df: pd.DataFrame) -> pd.DataFrame:
+    attached = df.copy()
+    attached["gravy"] = attached["peptide_mut"].map(gravy)
+    attached["aromaticity"] = attached["peptide_mut"].map(aromaticity)
+    attached["non_polar_ratio"] = attached["peptide_mut"].map(non_polar_ratio)
+    attached["delta_fraction"] = [
+        delta_residue_fraction(m, w) for m, w in zip(attached["peptide_mut"], attached["peptide_wt"], strict=True)
+    ]
+    attached["expression_tpm"] = attached.get("expression_tpm", 0.0)
+    return attached
+
+
+def build_immunology_smoke_dataset(settings, task) -> pd.DataFrame:
+    base = exact_dedup(load_smoke_seed(settings, task))
+    write_raw_snapshot(base, settings, task, "smoke")
+    pseudoseqs = load_pseudosequences(settings, task)
     mut_aff = netmhcpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist()).drop_duplicates(
         subset=["peptide_mut", "hla"]
     )
@@ -49,39 +66,76 @@ def build_smoke_dataset(settings) -> pd.DataFrame:
     stab = netmhcstabpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist()).drop_duplicates(
         subset=["peptide_mut", "hla"]
     )
-    foreignness = blast_foreignness(settings, base["peptide_mut"].tolist())
+    foreignness = blast_foreignness(settings, task, base["peptide_mut"].tolist())
     df = base.merge(mut_aff, on=["peptide_mut", "hla"]).merge(wt_aff, on=["peptide_wt", "hla"]).merge(
         stab, on=["peptide_mut", "hla"]
     )
     df = pd.concat([df.reset_index(drop=True), foreignness.reset_index(drop=True)], axis=1)
     df["hla_pseudosequence"] = df["hla"].map(pseudoseqs)
-    df["gravy"] = df["peptide_mut"].map(gravy)
-    df["aromaticity"] = df["peptide_mut"].map(aromaticity)
-    df["non_polar_ratio"] = df["peptide_mut"].map(non_polar_ratio)
-    df["delta_fraction"] = [delta_residue_fraction(m, w) for m, w in zip(df["peptide_mut"], df["peptide_wt"], strict=True)]
     df["agretopicity"] = [log_safe_ratio(wt, mt) for wt, mt in zip(df["wt_ba_score"], df["ba_score"], strict=True)]
-    df["expression_tpm"] = 0.0
-    df = assign_splits(df, num_folds=settings.smoke_dev_num_folds)
-    return df
+    return assign_splits(_attach_common_features(df), num_folds=task.dev_num_folds)
+
+
+def build_generic_pairwise_smoke_dataset(settings, task) -> pd.DataFrame:
+    df = exact_dedup(load_smoke_seed(settings, task))
+    write_raw_snapshot(df, settings, task, "smoke")
+    pseudoseqs = load_pseudosequences(settings, task)
+    df["hla_pseudosequence"] = df["hla"].map(pseudoseqs)
+    if df["hla_pseudosequence"].isna().any():
+        missing = sorted(df.loc[df["hla_pseudosequence"].isna(), "hla"].unique().tolist())
+        raise RuntimeError(f"Missing context pseudosequences for task {task.task_id}: {missing}")
+    if "agretopicity" not in df.columns:
+        df["agretopicity"] = [log_safe_ratio(wt, mt) for wt, mt in zip(df["wt_ba_score"], df["ba_score"], strict=True)]
+    required_scalar_columns = [
+        "ba_score",
+        "el_score",
+        "ba_rank",
+        "el_rank",
+        "wt_ba_score",
+        "wt_el_score",
+        "wt_ba_rank",
+        "wt_el_rank",
+        "stab_score",
+        "stab_rank",
+        "foreignness_score",
+        "blast_bitscore",
+        "blast_pident",
+    ]
+    missing = [column for column in required_scalar_columns if column not in df.columns]
+    if missing:
+        raise RuntimeError(f"Task {task.task_id} smoke seed is missing required proxy columns: {missing}")
+    return assign_splits(_attach_common_features(df), num_folds=task.dev_num_folds)
+
+
+def build_dataset(settings, task, mode: str) -> pd.DataFrame:
+    if mode != "smoke":
+        raise RuntimeError(f"Task {task.task_id} full ingest is not enabled yet.")
+    if task.family == "immunology":
+        return build_immunology_smoke_dataset(settings, task)
+    if task.family == "generic_pairwise":
+        return build_generic_pairwise_smoke_dataset(settings, task)
+    raise RuntimeError(f"Unsupported task family: {task.family}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=list_task_ids(), required=True)
     parser.add_argument("--mode", choices=["smoke", "full"], required=True)
     args = parser.parse_args()
     settings = load_settings(ROOT)
     ensure_directories(settings)
-    _verify_hard_requirements(settings, args.mode)
-    if args.mode == "full":
-        raise RuntimeError("Full mode is wired but intentionally blocked until source manifests and credentials are provided.")
-    df = build_smoke_dataset(settings)
-    output_dir = settings.data_processed / args.mode
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "dataset.parquet"
+    task = get_task_spec(args.task)
+    _verify_hard_requirements(settings, task, args.mode)
+    if args.mode == "full" and not task.full_enabled:
+        raise RuntimeError(f"Task {task.task_id} full ingest is intentionally blocked until source manifests are provided.")
+    df = build_dataset(settings, task, args.mode)
+    output_path = processed_dataset_path(settings, task.task_id, args.mode)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(output_path, index=False)
-    manifest_path = write_manifest(df, settings.split_manifest)
+    manifest_path = write_manifest(df, split_manifest_path(settings, task.task_id, args.mode))
     print(f"dataset_path: {output_path}")
     print(f"manifest_path: {manifest_path}")
+    print(f"task_id: {task.task_id}")
     print(f"rows: {len(df)}")
     print(f"splits: {df['split'].value_counts().to_dict()}")
 

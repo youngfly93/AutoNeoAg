@@ -12,6 +12,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from autoneoag.bootstrap import ensure_project_python
+
+ensure_project_python(ROOT)
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,6 +24,7 @@ import torch.nn.functional as F
 from autoneoag.config import load_settings
 from autoneoag.dataset import load_processed_dataset, split_frame
 from autoneoag.metrics.ranking import metric_bundle
+from autoneoag.tasks import get_task_spec, list_task_ids, processed_dataset_path, run_dir as task_run_dir
 
 
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
@@ -630,15 +635,24 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
-def run_training(mode: str, round_id: int, fold: int | None, checkpoint_name: str | None = None) -> dict[str, float | int | str]:
+def run_training(
+    task_id: str,
+    mode: str,
+    strategy: str,
+    run_id: int,
+    round_id: int,
+    fold: int | None,
+    checkpoint_name: str | None = None,
+) -> dict[str, float | int | str]:
     cfg = TrainConfig()
     seed_everything(cfg.seed)
     settings = load_settings(ROOT)
-    data_path = settings.data_processed / mode / "dataset.parquet"
+    task = get_task_spec(task_id)
+    data_path = processed_dataset_path(settings, task.task_id, mode)
     df = load_processed_dataset(data_path)
     device = device_for_run()
     start = time.time()
-    run_dir = settings.artifacts_runs / mode / f"round_{round_id:02d}"
+    run_dir = task_run_dir(settings, task.task_id, mode, strategy, run_id, round_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = checkpoint_name or f"round_{round_id:02d}"
     checkpoint_path = run_dir / f"{checkpoint}.pt"
@@ -724,24 +738,35 @@ def run_training(mode: str, round_id: int, fold: int | None, checkpoint_name: st
     metrics["peak_memory_mb"] = 0.0
     metrics["device"] = str(device)
     metrics["num_params"] = num_params
+    metrics["task_id"] = task.task_id
+    metrics["strategy"] = strategy
+    metrics["run_id"] = run_id
+    metrics["round_id"] = round_id
     metrics_payload["training_seconds"] = metrics["training_seconds"]
     metrics_payload["peak_memory_mb"] = metrics["peak_memory_mb"]
     metrics_payload["device"] = metrics["device"]
     metrics_payload["num_params"] = metrics["num_params"]
+    metrics_payload["task_id"] = metrics["task_id"]
+    metrics_payload["strategy"] = metrics["strategy"]
+    metrics_payload["run_id"] = metrics["run_id"]
+    metrics_payload["round_id"] = metrics["round_id"]
     (run_dir / f"{checkpoint}.metrics.json").write_text(json.dumps(metrics_payload, indent=2, sort_keys=True))
     return metrics
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=list_task_ids(), required=True)
     parser.add_argument("--mode", choices=["smoke", "full"], required=True)
+    parser.add_argument("--strategy", choices=["constrained", "random", "unconstrained"], default="constrained")
+    parser.add_argument("--run-id", type=int, default=1)
     parser.add_argument("--round-id", type=int, required=True)
     parser.add_argument("--fold", type=int, default=None)
     parser.add_argument("--checkpoint-name", default=None)
     args = parser.parse_args()
     if args.mode == "full":
         raise RuntimeError("Full training is not enabled until full data ingest is completed.")
-    metrics = run_training(args.mode, args.round_id, args.fold, args.checkpoint_name)
+    metrics = run_training(args.task, args.mode, args.strategy, args.run_id, args.round_id, args.fold, args.checkpoint_name)
     print("---")
     for key, value in metrics.items():
         if isinstance(value, float):
