@@ -28,6 +28,14 @@ def evaluate_split(mode: str, checkpoint: str, split_name: str) -> dict[str, flo
     model.load_state_dict(model_payload["state_dict"])
     model.eval()
     arrays = train_mod.build_arrays(split_df, cfg)
+    scalar_mean = model_payload.get("scalar_mean")
+    scalar_std = model_payload.get("scalar_std")
+    if scalar_mean is not None and scalar_std is not None:
+        arrays["scalars"] = train_mod.apply_scalar_stats(
+            arrays["scalars"],
+            np.asarray(scalar_mean, dtype=np.float32),
+            np.asarray(scalar_std, dtype=np.float32),
+        )
     scores, labels = [], []
     with torch.no_grad():
         for idx in range(len(split_df)):

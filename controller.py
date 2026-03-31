@@ -22,7 +22,7 @@ from autoneoag.runtime.git_ops import (
     has_commits,
     reset_hard,
 )
-from autoneoag.runtime.results import append_result, ensure_results_file
+from autoneoag.runtime.results import append_result, reset_results_file
 
 
 def run_python(module: str, *args: str) -> str:
@@ -49,12 +49,12 @@ def parse_metric(stdout: str, key: str = "val_score") -> float:
 def smoke(rounds: int) -> None:
     settings = load_settings(ROOT)
     ensure_directories(settings)
-    ensure_results_file(settings.results_tsv)
     if not has_commits(ROOT):
         raise RuntimeError("Create an initial scaffold commit before running controller smoke.")
-    prepare_stdout = run_python("prepare.py", "--mode", "smoke")
     log_dir = settings.artifacts_logs / "smoke"
     log_dir.mkdir(parents=True, exist_ok=True)
+    reset_results_file(settings.results_tsv)
+    prepare_stdout = run_python("prepare.py", "--mode", "smoke")
     (log_dir / "prepare.log").write_text(prepare_stdout)
     base_branch = current_branch(ROOT) or "main"
     branch_name = "autoneoag/smoke"

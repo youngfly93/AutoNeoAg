@@ -282,21 +282,21 @@ def tensors_from_arrays(arrays: dict[str, np.ndarray], indices: np.ndarray, devi
     }
 
 
-def run_training(mode: str, round_id: int, fold: int, checkpoint_name: str | None = None) -> dict[str, float]:
-    cfg = TrainConfig()
-    seed_everything(cfg.seed)
-    settings = load_settings(ROOT)
-    data_path = settings.data_processed / mode / "dataset.parquet"
-    df = load_processed_dataset(data_path)
-    train_df, val_df = split_frame(df, fold)
-    if train_df.empty or val_df.empty:
-        raise RuntimeError(f"Empty split encountered for fold={fold}: train={len(train_df)} val={len(val_df)}")
-    device = device_for_run()
+def dev_folds(df) -> list[int]:
+    folds = sorted({int(fold) for fold in df.loc[df["split"] == "dev", "fold"].tolist() if int(fold) >= 0})
+    if not folds:
+        raise RuntimeError("No development folds are available for training.")
+    return folds
+
+
+def fit_model(
+    train_df,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tuple[NeoantigenRanker, np.ndarray, np.ndarray]:
     train_arrays = build_arrays(train_df, cfg)
-    val_arrays = build_arrays(val_df, cfg)
     scalar_mean, scalar_std = fit_scalar_stats(train_arrays["scalars"])
     train_arrays["scalars"] = apply_scalar_stats(train_arrays["scalars"], scalar_mean, scalar_std)
-    val_arrays["scalars"] = apply_scalar_stats(val_arrays["scalars"], scalar_mean, scalar_std)
 
     indices = torch.arange(len(train_df), dtype=torch.long)
     loader = torch.utils.data.DataLoader(
@@ -308,7 +308,6 @@ def run_training(mode: str, round_id: int, fold: int, checkpoint_name: str | Non
 
     model = NeoantigenRanker(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    start = time.time()
 
     for _epoch in range(cfg.epochs):
         model.train()
@@ -319,27 +318,123 @@ def run_training(mode: str, round_id: int, fold: int, checkpoint_name: str | Non
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+    return model, scalar_mean, scalar_std
 
+
+def predict_scores(
+    model: NeoantigenRanker,
+    frame,
+    cfg: TrainConfig,
+    device: torch.device,
+    scalar_mean: np.ndarray,
+    scalar_std: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    arrays = build_arrays(frame, cfg)
+    arrays["scalars"] = apply_scalar_stats(arrays["scalars"], scalar_mean, scalar_std)
+    scores, labels = [], []
     model.eval()
     with torch.no_grad():
-        val_scores = []
-        val_labels = []
-        for idx in range(len(val_df)):
-            batch = tensors_from_arrays(val_arrays, np.array([idx]), device)
-            val_scores.append(torch.sigmoid(model(batch)).item())
-            val_labels.append(float(batch["labels"].item()))
+        for idx in range(len(frame)):
+            batch = tensors_from_arrays(arrays, np.array([idx]), device)
+            scores.append(torch.sigmoid(model(batch)).item())
+            labels.append(float(batch["labels"].item()))
+    return np.asarray(scores, dtype=np.float32), np.asarray(labels, dtype=np.float32)
 
-    metrics = metric_bundle(np.asarray(val_labels), np.asarray(val_scores))
-    metrics["training_seconds"] = time.time() - start
-    metrics["peak_memory_mb"] = 0.0
-    metrics["device"] = str(device)
-    metrics["num_params"] = float(sum(p.numel() for p in model.parameters()))
 
+def save_checkpoint(
+    path: Path,
+    model: NeoantigenRanker,
+    cfg: TrainConfig,
+    scalar_mean: np.ndarray,
+    scalar_std: np.ndarray,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    payload = {
+        "state_dict": model.state_dict(),
+        "config": asdict(cfg),
+        "scalar_mean": scalar_mean.tolist(),
+        "scalar_std": scalar_std.tolist(),
+        "metadata": metadata or {},
+    }
+    torch.save(payload, path)
+
+
+def run_training(mode: str, round_id: int, fold: int | None, checkpoint_name: str | None = None) -> dict[str, float | int | str]:
+    cfg = TrainConfig()
+    seed_everything(cfg.seed)
+    settings = load_settings(ROOT)
+    data_path = settings.data_processed / mode / "dataset.parquet"
+    df = load_processed_dataset(data_path)
+    device = device_for_run()
+    start = time.time()
     run_dir = settings.artifacts_runs / mode / f"round_{round_id:02d}"
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = checkpoint_name or f"round_{round_id:02d}"
-    torch.save({"state_dict": model.state_dict(), "config": asdict(cfg)}, run_dir / f"{checkpoint}.pt")
-    (run_dir / f"{checkpoint}.metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
+    checkpoint_path = run_dir / f"{checkpoint}.pt"
+
+    if fold is None:
+        folds = dev_folds(df)
+        oof_scores = []
+        oof_labels = []
+        fold_metrics: dict[str, dict[str, float]] = {}
+        for fold_id in folds:
+            train_df, val_df = split_frame(df, fold_id)
+            if train_df.empty or val_df.empty:
+                raise RuntimeError(f"Empty split encountered for fold={fold_id}: train={len(train_df)} val={len(val_df)}")
+            model, scalar_mean, scalar_std = fit_model(train_df, cfg, device)
+            fold_scores, fold_labels = predict_scores(model, val_df, cfg, device, scalar_mean, scalar_std)
+            fold_metric = metric_bundle(fold_labels, fold_scores)
+            fold_metrics[str(fold_id)] = fold_metric
+            oof_scores.append(fold_scores)
+            oof_labels.append(fold_labels)
+        full_dev = df[df["split"] == "dev"].reset_index(drop=True)
+        final_model, final_scalar_mean, final_scalar_std = fit_model(full_dev, cfg, device)
+        all_scores = np.concatenate(oof_scores)
+        all_labels = np.concatenate(oof_labels)
+        metrics = metric_bundle(all_labels, all_scores)
+        metrics["cv_num_folds"] = len(folds)
+        metrics["cv_num_samples"] = int(len(all_labels))
+        metrics["selection_mode"] = "grouped_cv_oof"
+        metrics_payload = {**metrics, "fold_metrics": fold_metrics}
+        save_checkpoint(
+            checkpoint_path,
+            final_model,
+            cfg,
+            final_scalar_mean,
+            final_scalar_std,
+            metadata={"selection_mode": "grouped_cv_oof", "folds": folds, "train_split": "dev"},
+        )
+        num_params = float(sum(p.numel() for p in final_model.parameters()))
+    else:
+        train_df, val_df = split_frame(df, fold)
+        if train_df.empty or val_df.empty:
+            raise RuntimeError(f"Empty split encountered for fold={fold}: train={len(train_df)} val={len(val_df)}")
+        model, scalar_mean, scalar_std = fit_model(train_df, cfg, device)
+        val_scores, val_labels = predict_scores(model, val_df, cfg, device, scalar_mean, scalar_std)
+        metrics = metric_bundle(val_labels, val_scores)
+        metrics["cv_num_folds"] = 1
+        metrics["cv_num_samples"] = int(len(val_labels))
+        metrics["selection_mode"] = "single_fold"
+        metrics_payload = dict(metrics)
+        save_checkpoint(
+            checkpoint_path,
+            model,
+            cfg,
+            scalar_mean,
+            scalar_std,
+            metadata={"selection_mode": "single_fold", "fold": fold, "train_split": "dev"},
+        )
+        num_params = float(sum(p.numel() for p in model.parameters()))
+
+    metrics["training_seconds"] = time.time() - start
+    metrics["peak_memory_mb"] = 0.0
+    metrics["device"] = str(device)
+    metrics["num_params"] = num_params
+    metrics_payload["training_seconds"] = metrics["training_seconds"]
+    metrics_payload["peak_memory_mb"] = metrics["peak_memory_mb"]
+    metrics_payload["device"] = metrics["device"]
+    metrics_payload["num_params"] = metrics["num_params"]
+    (run_dir / f"{checkpoint}.metrics.json").write_text(json.dumps(metrics_payload, indent=2, sort_keys=True))
     return metrics
 
 
@@ -347,7 +442,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["smoke", "full"], required=True)
     parser.add_argument("--round-id", type=int, required=True)
-    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--fold", type=int, default=None)
     parser.add_argument("--checkpoint-name", default=None)
     args = parser.parse_args()
     if args.mode == "full":
