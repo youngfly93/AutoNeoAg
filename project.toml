@@ -25,9 +25,10 @@ netmhcstabpan_tar = "netMHCstabpan.Darwin_arm64.tar"
 netmhcstabpan_home = ".local_tools/dtu/netMHCstabpan"
 
 [smoke]
-dataset_resource = "smoke_seed_v2.tsv"
+dataset_resource = "smoke_seed_v3.tsv"
 human_reference_resource = "smoke_human_reference.fasta"
 hla_pseudoseq_resource = "hla_pseudosequences.tsv"
 default_confirm_split = "confirm"
 default_blind_split = "blind"
 default_val_fold = 0
+dev_num_folds = 4

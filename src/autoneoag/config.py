@@ -31,6 +31,7 @@ class Settings:
     smoke_confirm_split: str
     smoke_blind_split: str
     smoke_val_fold: int
+    smoke_dev_num_folds: int
     smoke_rounds: int
 
 
@@ -72,6 +73,7 @@ def load_settings(root: Path | None = None) -> Settings:
         smoke_confirm_split=smoke["default_confirm_split"],
         smoke_blind_split=smoke["default_blind_split"],
         smoke_val_fold=int(smoke["default_val_fold"]),
+        smoke_dev_num_folds=int(smoke["dev_num_folds"]),
         smoke_rounds=int(project["smoke_rounds"]),
     )
 

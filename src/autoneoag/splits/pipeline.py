@@ -16,7 +16,7 @@ def _stable_fold(value: str, num_folds: int = 3) -> int:
     return int(digest[:8], 16) % num_folds
 
 
-def assign_splits(df: pd.DataFrame) -> pd.DataFrame:
+def assign_splits(df: pd.DataFrame, num_folds: int = 3) -> pd.DataFrame:
     split = []
     fold = []
     for _, row in df.iterrows():
@@ -29,7 +29,7 @@ def assign_splits(df: pd.DataFrame) -> pd.DataFrame:
             fold.append(-1)
         else:
             split.append("dev")
-            fold.append(_stable_fold(f"{row['mutation_event']}|{row['hla']}"))
+            fold.append(_stable_fold(f"{row['mutation_event']}|{row['hla']}", num_folds=num_folds))
     assigned = df.copy()
     assigned["split"] = split
     assigned["fold"] = fold
@@ -37,10 +37,12 @@ def assign_splits(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_manifest(df: pd.DataFrame, path: Path) -> Path:
+    dev_folds = df[df["split"] == "dev"]["fold"]
     payload = {
         "rows": len(df),
         "splits": df["split"].value_counts().to_dict(),
-        "folds": df[df["split"] == "dev"]["fold"].value_counts().sort_index().to_dict(),
+        "folds": dev_folds.value_counts().sort_index().to_dict(),
+        "num_dev_folds": int(dev_folds.nunique()),
         "challenge_splits": ["leave-study-out", "leave-HLA-supertype-out"],
     }
     path.parent.mkdir(parents=True, exist_ok=True)

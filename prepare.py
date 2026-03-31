@@ -34,7 +34,9 @@ def build_smoke_dataset(settings) -> pd.DataFrame:
     base = exact_dedup(load_smoke_seed(settings))
     write_raw_snapshot(base, settings.data_raw, "smoke")
     pseudoseqs = load_pseudosequences(settings)
-    mut_aff = netmhcpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist())
+    mut_aff = netmhcpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist()).drop_duplicates(
+        subset=["peptide_mut", "hla"]
+    )
     wt_aff = netmhcpan_predict(settings, base["peptide_wt"].tolist(), base["hla"].tolist()).rename(
         columns={
             "peptide_mut": "peptide_wt",
@@ -43,8 +45,10 @@ def build_smoke_dataset(settings) -> pd.DataFrame:
             "ba_rank": "wt_ba_rank",
             "el_rank": "wt_el_rank",
         }
+    ).drop_duplicates(subset=["peptide_wt", "hla"])
+    stab = netmhcstabpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist()).drop_duplicates(
+        subset=["peptide_mut", "hla"]
     )
-    stab = netmhcstabpan_predict(settings, base["peptide_mut"].tolist(), base["hla"].tolist())
     foreignness = blast_foreignness(settings, base["peptide_mut"].tolist())
     df = base.merge(mut_aff, on=["peptide_mut", "hla"]).merge(wt_aff, on=["peptide_wt", "hla"]).merge(
         stab, on=["peptide_mut", "hla"]
@@ -57,7 +61,7 @@ def build_smoke_dataset(settings) -> pd.DataFrame:
     df["delta_fraction"] = [delta_residue_fraction(m, w) for m, w in zip(df["peptide_mut"], df["peptide_wt"], strict=True)]
     df["agretopicity"] = [log_safe_ratio(wt, mt) for wt, mt in zip(df["wt_ba_score"], df["ba_score"], strict=True)]
     df["expression_tpm"] = 0.0
-    df = assign_splits(df)
+    df = assign_splits(df, num_folds=settings.smoke_dev_num_folds)
     return df
 
 
@@ -84,4 +88,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

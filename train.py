@@ -26,29 +26,50 @@ AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 AA_TO_ID = {aa: idx + 1 for idx, aa in enumerate(AMINO_ACIDS)}
 
 # Search-space guidance:
-# Keep edits focused on scalar feature usage, sequence encoders, WT-vs-Mut
-# interaction structure, and the fusion block. Avoid micro-tuning the loss.
-SCALAR_COLUMNS = [
-    "mut_log_ba",
-    "mut_el_score",
-    "mut_ba_rank",
-    "mut_el_rank",
-    "wt_log_ba",
-    "wt_el_score",
-    "wt_ba_rank",
-    "wt_el_rank",
-    "stab_log_half_life",
-    "stab_rank",
-    "foreignness_score",
-    "blast_bitscore",
-    "blast_pident",
-    "gravy",
-    "aromaticity",
-    "non_polar_ratio",
-    "delta_fraction",
-    "agretopicity",
-    "peptide_length_scaled",
-]
+# Prefer higher-level changes over local pooling tweaks:
+# 1. feature block composition and scalar comparison blocks
+# 2. WT-vs-Mut contrast head structure
+# 3. pair/group ranking objectives
+# 4. only then sequence/fusion micro-architecture
+FEATURE_BLOCK_COLUMNS = {
+    "base": (
+        "mut_log_ba",
+        "mut_el_score",
+        "mut_ba_rank",
+        "mut_el_rank",
+        "wt_log_ba",
+        "wt_el_score",
+        "wt_ba_rank",
+        "wt_el_rank",
+        "stab_log_half_life",
+        "stab_rank",
+        "foreignness_score",
+        "blast_bitscore",
+        "blast_pident",
+        "gravy",
+        "aromaticity",
+        "non_polar_ratio",
+        "delta_fraction",
+        "agretopicity",
+        "peptide_length_scaled",
+    ),
+    "comparison": (
+        "wt_minus_mut_log_ba",
+        "mut_minus_wt_el",
+        "wt_minus_mut_ba_rank",
+        "wt_minus_mut_el_rank",
+        "delta_x_agretopicity",
+        "delta_x_foreignness",
+    ),
+    "context": (
+        "delta_x_stability",
+        "foreignness_x_stability",
+        "mut_el_x_length",
+        "blast_consistency",
+    ),
+}
+DEFAULT_FEATURE_BLOCKS = ("base", "comparison", "context")
+OBJECTIVE_REGISTRY = ("bce", "hybrid_pairwise", "pairwise_only")
 
 
 @dataclass
@@ -58,8 +79,9 @@ class TrainConfig:
     peptide_embed_dim: int = 24
     hla_embed_dim: int = 24
     seq_hidden_dim: int = 32
-    scalar_hidden_dim: int = 40
-    fusion_hidden_dim: int = 72
+    scalar_hidden_dim: int = 48
+    contrast_hidden_dim: int = 48
+    fusion_hidden_dim: int = 96
     seq_kernel_size: int = 3
     dropout: float = 0.15
     lr: float = 8e-4
@@ -67,6 +89,10 @@ class TrainConfig:
     epochs: int = 55
     batch_size: int = 8
     seed: int = 7
+    feature_blocks: tuple[str, ...] = DEFAULT_FEATURE_BLOCKS
+    objective_mode: str = "bce"
+    pairwise_weight: float = 0.25
+    contrast_logit_weight: float = 0.30
 
 
 def seed_everything(seed: int) -> None:
@@ -81,6 +107,19 @@ def device_for_run() -> torch.device:
     return torch.device("cpu")
 
 
+def selected_scalar_columns(cfg: TrainConfig) -> list[str]:
+    columns: list[str] = []
+    for block_name in cfg.feature_blocks:
+        if block_name not in FEATURE_BLOCK_COLUMNS:
+            raise KeyError(f"Unknown feature block: {block_name}")
+        columns.extend(FEATURE_BLOCK_COLUMNS[block_name])
+    return columns
+
+
+def scalar_input_dim(cfg: TrainConfig) -> int:
+    return len(selected_scalar_columns(cfg))
+
+
 def encode_sequence(sequence: str, length: int) -> list[int]:
     ids = [AA_TO_ID.get(char, 0) for char in sequence[:length]]
     return ids + [0] * (length - len(ids))
@@ -92,30 +131,93 @@ def encode_delta_sequence(mut: str, wt: str, length: int) -> list[int]:
     return tokens + [0] * (length - len(tokens))
 
 
-def build_scalar_matrix(df) -> np.ndarray:
-    return np.column_stack(
+def build_feature_blocks(df) -> dict[str, np.ndarray]:
+    mut_log_ba = np.log1p(df["ba_score"].fillna(5e4).clip(lower=0.0))
+    wt_log_ba = np.log1p(df["wt_ba_score"].fillna(5e4).clip(lower=0.0))
+    mut_el = df["el_score"].fillna(0.0)
+    wt_el = df["wt_el_score"].fillna(0.0)
+    mut_ba_rank = df["ba_rank"].fillna(100.0)
+    wt_ba_rank = df["wt_ba_rank"].fillna(100.0)
+    mut_el_rank = df["el_rank"].fillna(100.0)
+    wt_el_rank = df["wt_el_rank"].fillna(100.0)
+    stab_log_half_life = np.log1p(df["stab_score"].fillna(0.0).clip(lower=0.0))
+    stab_rank = df["stab_rank"].fillna(100.0)
+    foreignness = df["foreignness_score"].fillna(0.0)
+    blast_bitscore = df["blast_bitscore"].fillna(0.0)
+    blast_pident = df["blast_pident"].fillna(0.0)
+    gravy = df["gravy"].fillna(0.0)
+    aromaticity = df["aromaticity"].fillna(0.0)
+    non_polar = df["non_polar_ratio"].fillna(0.0)
+    delta_fraction = df["delta_fraction"].fillna(0.0)
+    agretopicity = df["agretopicity"].fillna(0.0)
+    peptide_length_scaled = df["peptide_length"].fillna(0.0) / 11.0
+
+    base = np.column_stack(
         [
-            np.log1p(df["ba_score"].fillna(5e4).clip(lower=0.0)),
-            df["el_score"].fillna(0.0),
-            df["ba_rank"].fillna(100.0),
-            df["el_rank"].fillna(100.0),
-            np.log1p(df["wt_ba_score"].fillna(5e4).clip(lower=0.0)),
-            df["wt_el_score"].fillna(0.0),
-            df["wt_ba_rank"].fillna(100.0),
-            df["wt_el_rank"].fillna(100.0),
-            np.log1p(df["stab_score"].fillna(0.0).clip(lower=0.0)),
-            df["stab_rank"].fillna(100.0),
-            df["foreignness_score"].fillna(0.0),
-            df["blast_bitscore"].fillna(0.0),
-            df["blast_pident"].fillna(0.0),
-            df["gravy"].fillna(0.0),
-            df["aromaticity"].fillna(0.0),
-            df["non_polar_ratio"].fillna(0.0),
-            df["delta_fraction"].fillna(0.0),
-            df["agretopicity"].fillna(0.0),
-            df["peptide_length"].fillna(0.0) / 11.0,
+            mut_log_ba,
+            mut_el,
+            mut_ba_rank,
+            mut_el_rank,
+            wt_log_ba,
+            wt_el,
+            wt_ba_rank,
+            wt_el_rank,
+            stab_log_half_life,
+            stab_rank,
+            foreignness,
+            blast_bitscore,
+            blast_pident,
+            gravy,
+            aromaticity,
+            non_polar,
+            delta_fraction,
+            agretopicity,
+            peptide_length_scaled,
         ]
     ).astype(np.float32)
+
+    comparison = np.column_stack(
+        [
+            wt_log_ba - mut_log_ba,
+            mut_el - wt_el,
+            wt_ba_rank - mut_ba_rank,
+            wt_el_rank - mut_el_rank,
+            delta_fraction * agretopicity,
+            delta_fraction * foreignness,
+        ]
+    ).astype(np.float32)
+
+    context = np.column_stack(
+        [
+            delta_fraction * stab_log_half_life,
+            foreignness * stab_log_half_life,
+            mut_el * peptide_length_scaled,
+            blast_bitscore * (blast_pident / 100.0),
+        ]
+    ).astype(np.float32)
+
+    return {
+        "base": base,
+        "comparison": comparison,
+        "context": context,
+    }
+
+
+def build_scalar_matrix(df, cfg: TrainConfig) -> np.ndarray:
+    blocks = build_feature_blocks(df)
+    matrices = [blocks[block_name] for block_name in cfg.feature_blocks]
+    return np.concatenate(matrices, axis=1).astype(np.float32)
+
+
+def encode_group_ids(df) -> np.ndarray:
+    lookup: dict[str, int] = {}
+    encoded = []
+    for study_id, hla in zip(df["study_id"], df["hla"], strict=True):
+        key = f"{study_id}|{hla}"
+        if key not in lookup:
+            lookup[key] = len(lookup)
+        encoded.append(lookup[key])
+    return np.asarray(encoded, dtype=np.int64)
 
 
 def fit_scalar_stats(scalars: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -186,6 +288,39 @@ class ScalarTower(nn.Module):
         return self.net(self.input_norm(scalars))
 
 
+class ContrastHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.logit = nn.Linear(hidden_dim, 1)
+
+    def forward(self, contrast_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.net(contrast_inputs)
+        return hidden, self.logit(hidden).squeeze(1)
+
+
+class FusionBlock(nn.Module):
+    def __init__(self, seq_dim: int, conditioning_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.affine = nn.Linear(conditioning_dim, seq_dim * 2)
+        self.residual = nn.Linear(conditioning_dim, seq_dim)
+        self.norm = nn.LayerNorm(seq_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, sequence_features: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+        scale, shift = self.affine(conditioning).chunk(2, dim=1)
+        modulated = sequence_features * (1.0 + 0.1 * torch.tanh(scale))
+        modulated = modulated + 0.1 * shift + 0.1 * self.residual(conditioning)
+        return self.norm(sequence_features + self.dropout(modulated))
+
+
 class NeoantigenRanker(nn.Module):
     def __init__(self, cfg: TrainConfig) -> None:
         super().__init__()
@@ -207,17 +342,17 @@ class NeoantigenRanker(nn.Module):
             kernel_size=cfg.seq_kernel_size,
             dropout=cfg.dropout,
         )
-        self.scalar_tower = ScalarTower(len(SCALAR_COLUMNS), cfg.scalar_hidden_dim, cfg.dropout)
+        self.scalar_tower = ScalarTower(scalar_input_dim(cfg), cfg.scalar_hidden_dim, cfg.dropout)
 
         seq_width = cfg.seq_hidden_dim * 2
-        pair_width = seq_width * 7
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(cfg.scalar_hidden_dim, pair_width),
-            nn.Sigmoid(),
-        )
-        self.fusion_norm = nn.LayerNorm(pair_width)
+        contrast_input_dim = seq_width * 6
+        self.contrast_head = ContrastHead(contrast_input_dim, cfg.contrast_hidden_dim, cfg.dropout)
+
+        pair_width = seq_width * 8
+        conditioning_dim = cfg.scalar_hidden_dim + cfg.contrast_hidden_dim
+        self.fusion = FusionBlock(pair_width, conditioning_dim, cfg.dropout)
         self.head = nn.Sequential(
-            nn.Linear(pair_width + cfg.scalar_hidden_dim, cfg.fusion_hidden_dim),
+            nn.Linear(pair_width + conditioning_dim, cfg.fusion_hidden_dim),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.fusion_hidden_dim, cfg.fusion_hidden_dim // 2),
@@ -233,25 +368,67 @@ class NeoantigenRanker(nn.Module):
         hla = self.hla_encoder(batch["hla_tokens"])
         scalars = self.scalar_tower(batch["scalars"])
 
+        average_peptide = 0.5 * (mut + wt)
+        contrast_inputs = torch.cat(
+            [
+                mut - wt,
+                torch.abs(mut - wt),
+                delta,
+                mut * wt,
+                (mut - wt) * hla,
+                delta * hla,
+            ],
+            dim=1,
+        )
+        contrast_hidden, contrast_logit = self.contrast_head(contrast_inputs)
+
         sequence_features = torch.cat(
             [
                 mut,
                 wt,
                 delta,
                 hla,
+                mut * wt,
+                average_peptide * hla,
                 mut - wt,
-                mut * hla,
-                delta * hla,
+                (mut - wt) * hla,
             ],
             dim=1,
         )
-        gated_features = self.fusion_norm(sequence_features * self.fusion_gate(scalars))
-        fused = torch.cat([gated_features, scalars], dim=1)
-        return self.head(fused).squeeze(1)
+        conditioning = torch.cat([scalars, contrast_hidden], dim=1)
+        fused = self.fusion(sequence_features, conditioning)
+        main_logit = self.head(torch.cat([fused, conditioning], dim=1)).squeeze(1)
+        return main_logit + self.cfg.contrast_logit_weight * contrast_logit
 
 
-def classification_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return F.binary_cross_entropy_with_logits(logits, labels)
+def pairwise_ranking_loss(logits: torch.Tensor, labels: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
+    losses = []
+    for group_id in torch.unique(group_ids):
+        mask = group_ids == group_id
+        if int(mask.sum().item()) < 2:
+            continue
+        group_logits = logits[mask]
+        group_labels = labels[mask]
+        positives = group_logits[group_labels > 0.5]
+        negatives = group_logits[group_labels <= 0.5]
+        if positives.numel() == 0 or negatives.numel() == 0:
+            continue
+        losses.append(F.softplus(-(positives.unsqueeze(1) - negatives.unsqueeze(0))).mean())
+    if not losses:
+        return logits.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def objective_loss(logits: torch.Tensor, labels: torch.Tensor, group_ids: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    if cfg.objective_mode not in OBJECTIVE_REGISTRY:
+        raise KeyError(f"Unknown objective mode: {cfg.objective_mode}")
+    bce = F.binary_cross_entropy_with_logits(logits, labels)
+    pairwise = pairwise_ranking_loss(logits, labels, group_ids)
+    if cfg.objective_mode == "bce":
+        return bce
+    if cfg.objective_mode == "hybrid_pairwise":
+        return bce + cfg.pairwise_weight * pairwise
+    return pairwise
 
 
 def build_arrays(df, cfg: TrainConfig | None = None) -> dict[str, np.ndarray]:
@@ -266,9 +443,18 @@ def build_arrays(df, cfg: TrainConfig | None = None) -> dict[str, np.ndarray]:
         ],
         dtype=np.int64,
     )
-    scalars = build_scalar_matrix(df)
+    scalars = build_scalar_matrix(df, cfg)
     labels = df["label"].to_numpy(dtype=np.float32)
-    return {"mut": mut, "wt": wt, "hla": hla, "delta": delta, "scalars": scalars, "labels": labels}
+    group_ids = encode_group_ids(df)
+    return {
+        "mut": mut,
+        "wt": wt,
+        "hla": hla,
+        "delta": delta,
+        "scalars": scalars,
+        "labels": labels,
+        "group_ids": group_ids,
+    }
 
 
 def tensors_from_arrays(arrays: dict[str, np.ndarray], indices: np.ndarray, device: torch.device) -> dict[str, torch.Tensor]:
@@ -279,6 +465,7 @@ def tensors_from_arrays(arrays: dict[str, np.ndarray], indices: np.ndarray, devi
         "delta_tokens": torch.as_tensor(arrays["delta"][indices], device=device),
         "scalars": torch.as_tensor(arrays["scalars"][indices], device=device),
         "labels": torch.as_tensor(arrays["labels"][indices], device=device),
+        "group_ids": torch.as_tensor(arrays["group_ids"][indices], device=device),
     }
 
 
@@ -298,11 +485,13 @@ def fit_model(
     scalar_mean, scalar_std = fit_scalar_stats(train_arrays["scalars"])
     train_arrays["scalars"] = apply_scalar_stats(train_arrays["scalars"], scalar_mean, scalar_std)
 
+    effective_batch_size = len(train_df) if cfg.objective_mode != "bce" else min(cfg.batch_size, len(train_df))
+    shuffle = effective_batch_size < len(train_df)
     indices = torch.arange(len(train_df), dtype=torch.long)
     loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(indices),
-        batch_size=cfg.batch_size,
-        shuffle=True,
+        batch_size=max(1, effective_batch_size),
+        shuffle=shuffle,
         generator=torch.Generator().manual_seed(cfg.seed),
     )
 
@@ -314,7 +503,7 @@ def fit_model(
         for (batch_indices,) in loader:
             batch = tensors_from_arrays(train_arrays, batch_indices.numpy(), device)
             logits = model(batch)
-            loss = classification_loss(logits, batch["labels"])
+            loss = objective_loss(logits, batch["labels"], batch["group_ids"], cfg)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -395,14 +584,26 @@ def run_training(mode: str, round_id: int, fold: int | None, checkpoint_name: st
         metrics["cv_num_folds"] = len(folds)
         metrics["cv_num_samples"] = int(len(all_labels))
         metrics["selection_mode"] = "grouped_cv_oof"
-        metrics_payload = {**metrics, "fold_metrics": fold_metrics}
+        metrics_payload = {
+            **metrics,
+            "fold_metrics": fold_metrics,
+            "feature_blocks": list(cfg.feature_blocks),
+            "objective_mode": cfg.objective_mode,
+            "selected_scalar_columns": selected_scalar_columns(cfg),
+        }
         save_checkpoint(
             checkpoint_path,
             final_model,
             cfg,
             final_scalar_mean,
             final_scalar_std,
-            metadata={"selection_mode": "grouped_cv_oof", "folds": folds, "train_split": "dev"},
+            metadata={
+                "selection_mode": "grouped_cv_oof",
+                "folds": folds,
+                "train_split": "dev",
+                "feature_blocks": list(cfg.feature_blocks),
+                "objective_mode": cfg.objective_mode,
+            },
         )
         num_params = float(sum(p.numel() for p in final_model.parameters()))
     else:
@@ -415,14 +616,25 @@ def run_training(mode: str, round_id: int, fold: int | None, checkpoint_name: st
         metrics["cv_num_folds"] = 1
         metrics["cv_num_samples"] = int(len(val_labels))
         metrics["selection_mode"] = "single_fold"
-        metrics_payload = dict(metrics)
+        metrics_payload = {
+            **metrics,
+            "feature_blocks": list(cfg.feature_blocks),
+            "objective_mode": cfg.objective_mode,
+            "selected_scalar_columns": selected_scalar_columns(cfg),
+        }
         save_checkpoint(
             checkpoint_path,
             model,
             cfg,
             scalar_mean,
             scalar_std,
-            metadata={"selection_mode": "single_fold", "fold": fold, "train_split": "dev"},
+            metadata={
+                "selection_mode": "single_fold",
+                "fold": fold,
+                "train_split": "dev",
+                "feature_blocks": list(cfg.feature_blocks),
+                "objective_mode": cfg.objective_mode,
+            },
         )
         num_params = float(sum(p.numel() for p in model.parameters()))
 
