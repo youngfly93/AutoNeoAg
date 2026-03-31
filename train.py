@@ -120,6 +120,16 @@ def scalar_input_dim(cfg: TrainConfig) -> int:
     return len(selected_scalar_columns(cfg))
 
 
+def feature_block_slices(cfg: TrainConfig) -> dict[str, slice]:
+    slices: dict[str, slice] = {}
+    start = 0
+    for block_name in cfg.feature_blocks:
+        width = len(FEATURE_BLOCK_COLUMNS[block_name])
+        slices[block_name] = slice(start, start + width)
+        start += width
+    return slices
+
+
 def encode_sequence(sequence: str, length: int) -> list[int]:
     ids = [AA_TO_ID.get(char, 0) for char in sequence[:length]]
     return ids + [0] * (length - len(ids))
@@ -306,6 +316,22 @@ class ContrastHead(nn.Module):
         return hidden, self.logit(hidden).squeeze(1)
 
 
+class ContrastConditioner(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+        )
+
+    def forward(self, scalars: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scale, shift = self.net(scalars).chunk(2, dim=1)
+        return scale, shift
+
+
 class FusionBlock(nn.Module):
     def __init__(self, seq_dim: int, conditioning_dim: int, dropout: float) -> None:
         super().__init__()
@@ -325,6 +351,7 @@ class NeoantigenRanker(nn.Module):
     def __init__(self, cfg: TrainConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self.block_slices = feature_block_slices(cfg)
         vocab_size = len(AA_TO_ID) + 1
         self.peptide_encoder = SequenceEncoder(
             vocab_size=vocab_size,
@@ -345,8 +372,18 @@ class NeoantigenRanker(nn.Module):
         self.scalar_tower = ScalarTower(scalar_input_dim(cfg), cfg.scalar_hidden_dim, cfg.dropout)
 
         seq_width = cfg.seq_hidden_dim * 2
-        contrast_input_dim = seq_width * 6
+        contrast_input_dim = seq_width * 7
         self.contrast_head = ContrastHead(contrast_input_dim, cfg.contrast_hidden_dim, cfg.dropout)
+        contrast_scalar_dim = sum(
+            len(FEATURE_BLOCK_COLUMNS[block_name])
+            for block_name in cfg.feature_blocks
+            if block_name in {"comparison", "context"}
+        )
+        self.contrast_conditioner = (
+            ContrastConditioner(contrast_scalar_dim, cfg.contrast_hidden_dim, cfg.dropout)
+            if contrast_scalar_dim > 0
+            else None
+        )
 
         pair_width = seq_width * 8
         conditioning_dim = cfg.scalar_hidden_dim + cfg.contrast_hidden_dim
@@ -367,20 +404,33 @@ class NeoantigenRanker(nn.Module):
         delta = self.peptide_encoder(batch["delta_tokens"])
         hla = self.hla_encoder(batch["hla_tokens"])
         scalars = self.scalar_tower(batch["scalars"])
+        contrast_scalar_parts = []
+        for block_name in ("comparison", "context"):
+            block_slice = self.block_slices.get(block_name)
+            if block_slice is not None:
+                contrast_scalar_parts.append(batch["scalars"][:, block_slice])
 
         average_peptide = 0.5 * (mut + wt)
+        mut_hla = mut * hla
+        wt_hla = wt * hla
         contrast_inputs = torch.cat(
             [
                 mut - wt,
                 torch.abs(mut - wt),
                 delta,
                 mut * wt,
+                mut_hla - wt_hla,
                 (mut - wt) * hla,
                 delta * hla,
             ],
             dim=1,
         )
         contrast_hidden, contrast_logit = self.contrast_head(contrast_inputs)
+        if self.contrast_conditioner is not None and contrast_scalar_parts:
+            contrast_scalar_inputs = torch.cat(contrast_scalar_parts, dim=1)
+            contrast_scale, contrast_shift = self.contrast_conditioner(contrast_scalar_inputs)
+            contrast_hidden = contrast_hidden * (1.0 + 0.1 * torch.tanh(contrast_scale))
+            contrast_hidden = contrast_hidden + 0.1 * contrast_shift
 
         sequence_features = torch.cat(
             [
