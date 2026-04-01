@@ -33,7 +33,7 @@ from autoneoag.runtime.git_ops import (
     current_commit,
     ensure_branch,
     has_commits,
-    reset_hard,
+    reset_hard_preserving,
 )
 from autoneoag.runtime.random_worker import run_random_worker
 from autoneoag.runtime.results import append_result, load_results, reset_results_file
@@ -219,6 +219,7 @@ def run_experiment(
     task = get_task_spec(task_id)
     settings = load_settings(ROOT)
     ensure_directories(settings)
+    results_path = settings.results_tsv
     if not has_commits(ROOT):
         raise RuntimeError("Create an initial scaffold commit before running controller.")
     if reset_results:
@@ -471,7 +472,7 @@ def run_experiment(
                 (logs / f"round_{round_id:03d}.log").write_text(failure_log)
                 if round_id == 1:
                     raise RuntimeError(f"Baseline training failed for round {round_id}\n{failure_log}") from exc
-                reset_hard(ROOT, best_commit)
+                reset_hard_preserving(ROOT, best_commit, [results_path])
                 append_result(
                     settings.results_tsv,
                     task_id=task.task_id,
@@ -546,7 +547,7 @@ def run_experiment(
                     task_run_dir(settings, task.task_id, mode, strategy, run_id, round_id) / f"round_{round_id:02d}.pt"
                 )
             elif round_id > 1:
-                reset_hard(ROOT, best_commit)
+                reset_hard_preserving(ROOT, best_commit, [results_path])
 
             if confirm_checked:
                 confirm_metrics = parse_json_output(

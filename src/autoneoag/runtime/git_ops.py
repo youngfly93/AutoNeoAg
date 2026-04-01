@@ -57,6 +57,22 @@ def reset_hard(root: Path, commit: str) -> None:
     _run(["git", "reset", "--hard", commit], root)
 
 
+def reset_hard_preserving(root: Path, commit: str, preserve_paths: list[Path | str]) -> None:
+    preserved: dict[Path, bytes | None] = {}
+    for item in preserve_paths:
+        path = Path(item)
+        full_path = path if path.is_absolute() else root / path
+        preserved[full_path] = full_path.read_bytes() if full_path.exists() else None
+    reset_hard(root, commit)
+    for full_path, data in preserved.items():
+        if data is None:
+            if full_path.exists():
+                full_path.unlink()
+            continue
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(data)
+
+
 def changed_files(root: Path, paths: list[str] | None = None) -> list[str]:
     args = ["git", "diff", "--name-only"]
     if paths:
