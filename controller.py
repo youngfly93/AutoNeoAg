@@ -570,7 +570,6 @@ def run_experiment(
                 status=status,
                 decision_reason=decision_reason(status, val_score, best_score_before, None),
                 failure_type=None,
-                failure_mode=infer_failure_mode(None, proposal_family, description),
                 training_seconds=training_seconds,
                 lines_changed=line_count,
                 worker_declared_family=worker_declared_family,
@@ -590,6 +589,11 @@ def run_experiment(
                 delta_vs_parent=delta_vs_parent,
                 novelty_level=novelty_level,
                 description=description,
+                failure_mode=(
+                    None
+                    if status == "keep"
+                    else infer_failure_mode(None, proposal_family, description)
+                ),
             )
             summary_lines.append(
                 json.dumps(
@@ -606,6 +610,14 @@ def run_experiment(
                     ensure_ascii=False,
                 )
             )
+            latest_state = build_frontier_state(
+                task_id=task.task_id,
+                strategy=strategy,
+                run_id=run_id,
+                current_round=round_id + 1,
+                rows=load_results(settings.results_tsv),
+            )
+            write_frontier_artifacts(logs, latest_state)
 
         confirm_metrics = parse_json_output(
             run_python("confirm.py", "--task", task.task_id, "--mode", mode, "--checkpoint", best_checkpoint)
@@ -633,6 +645,14 @@ def run_experiment(
                 ]
             )
         )
+        final_state = build_frontier_state(
+            task_id=task.task_id,
+            strategy=strategy,
+            run_id=run_id,
+            current_round=rounds + 1,
+            rows=load_results(settings.results_tsv),
+        )
+        write_frontier_artifacts(logs, final_state)
     finally:
         checkout_branch(ROOT, base_branch)
 
