@@ -17,6 +17,13 @@ ensure_project_python(ROOT)
 
 from autoneoag.config import ensure_directories, load_settings
 from autoneoag.runtime.codex_worker import allowed_edit_scope, run_codex_worker
+from autoneoag.runtime.frontier import (
+    build_frontier_state,
+    canonical_family,
+    infer_family_from_text,
+    infer_subfamily_from_text,
+    write_frontier_artifacts,
+)
 from autoneoag.runtime.git_ops import (
     changed_files,
     changed_line_count,
@@ -58,9 +65,17 @@ def parse_json_output(stdout: str) -> dict[str, object]:
     return json.loads(stdout)
 
 
-def proposal_for_strategy(settings, task_id: str, strategy: str, round_id: int, summary: str) -> dict[str, object]:
+def proposal_for_strategy(
+    settings,
+    task_id: str,
+    strategy: str,
+    round_id: int,
+    summary: str,
+    frontier_state: dict[str, object] | None = None,
+    frontier_hint: str = "",
+) -> dict[str, object]:
     if strategy == "random":
-        return run_random_worker(round_id, ROOT)
+        return run_random_worker(round_id, ROOT, frontier_state=frontier_state)
     return run_codex_worker(
         settings,
         task_id=task_id,
@@ -68,6 +83,8 @@ def proposal_for_strategy(settings, task_id: str, strategy: str, round_id: int, 
         round_id=round_id,
         root=ROOT,
         summary=summary,
+        frontier_hint=frontier_hint,
+        frontier_state=frontier_state,
     )
 
 
@@ -77,6 +94,63 @@ def snapshot_files(root: Path, paths: set[str]) -> dict[str, str | None]:
         file_path = root / path
         snapshot[path] = file_path.read_text() if file_path.exists() else None
     return snapshot
+
+
+def diff_text(root: Path, paths: list[str]) -> str:
+    if not paths:
+        return ""
+    completed = subprocess.run(
+        ["git", "diff", "--", *paths],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
+
+
+def boolish(value: object) -> str:
+    return "1" if bool(value) else "0"
+
+
+def count_keeps(settings, task_id: str, strategy: str, run_id: int) -> int:
+    rows = [
+        row
+        for row in load_results(settings.results_tsv)
+        if row["task_id"] == task_id and row["strategy"] == strategy and int(row["run_id"]) == run_id and row["status"] == "keep"
+    ]
+    return len(rows)
+
+
+def should_run_round_confirm(status: str, keep_count_after_round: int) -> bool:
+    return status == "keep" and (keep_count_after_round == 1 or keep_count_after_round % 3 == 0)
+
+
+def decision_reason(status: str, val_score: float | None, best_score_before: float, failure_type: str | None) -> str:
+    if failure_type:
+        return failure_type
+    if status == "keep":
+        return "new_best"
+    if val_score is None:
+        return "unknown"
+    if best_score_before == float("-inf"):
+        return "baseline"
+    if best_score_before - val_score <= 0.01:
+        return "near_tie_but_worse"
+    return "clear_regression"
+
+
+def infer_failure_mode(failure_type: str | None, family: str, description: str) -> str | None:
+    if failure_type in {"train_failed", "worker_failed", "no_op"}:
+        return failure_type
+    text = description.lower()
+    if family == "gating":
+        return "family_repeat_regression"
+    if "direct" in text and "context" in text:
+        return "redundant_context_injection"
+    if "unstable" in text:
+        return "unstable_training"
+    return None
 
 
 @dataclass
@@ -167,6 +241,18 @@ def run_experiment(
         summary_lines = [prepare_stdout.strip(), *(resume_state.summary_lines if resume_state is not None else [])]
         start_round = resume_state.start_round if resume_state is not None else 1
         allowed_files = set(allowed_edit_scope(strategy)) if strategy != "random" else {"train.py"}
+        prior_rows = [
+            row
+            for row in load_results(settings.results_tsv)
+            if row["task_id"] == task.task_id and row["strategy"] == strategy and int(row["run_id"]) == run_id
+        ]
+        keep_count = sum(1 for row in prior_rows if row["status"] == "keep")
+        confirmed_scores = [
+            _result_float(row.get("confirm_round_score") or row.get("confirm_score"))
+            for row in prior_rows
+            if row.get("confirm_checked") in {"1", "true", "True"}
+        ]
+        best_confirm_score = max((score for score in confirmed_scores if score is not None), default=None)
 
         for round_id in range(start_round, rounds + 1):
             description = "baseline"
@@ -176,15 +262,56 @@ def run_experiment(
                 "risk": "none",
                 "edit_scope": ["train.py"],
                 "summary": "baseline",
+                "worker_declared_family": "other",
+                "worker_declared_subfamily": "baseline",
+                "proposal_family": "other",
+                "proposal_subfamily": "baseline",
+                "parent_round_id": None,
+                "search_mode": "exploit",
+                "novelty_level": "low",
             }
             candidate_commit = best_commit
             line_count = 0
+            frontier_state: dict[str, object] | None = None
+            frontier_hint_text = ""
+            parent_commit = best_commit
+            worker_declared_family = "other"
+            worker_declared_subfamily = "baseline"
+            controller_family = "other"
+            controller_subfamily = "baseline"
+            proposal_family = "other"
+            proposal_subfamily = "baseline"
+            family_consensus = "controller_only"
+            parent_round_id: int | None = None
+            search_mode = "exploit"
+            novelty_level = "low"
 
             if round_id > 1:
+                frontier_state = build_frontier_state(
+                    task_id=task.task_id,
+                    strategy=strategy,
+                    run_id=run_id,
+                    current_round=round_id,
+                    rows=load_results(settings.results_tsv),
+                )
+                _, hint_path, _ = write_frontier_artifacts(logs, frontier_state)
+                frontier_hint_text = hint_path.read_text()
+                champion = frontier_state.get("champion", {})
+                parent_round_id = champion.get("round_id")
+                parent_commit = champion.get("commit", best_commit) or best_commit
+                search_mode = str(frontier_state.get("search_mode", "exploit"))
                 preexisting_dirty = set(changed_files(ROOT))
                 before_snapshot = snapshot_files(ROOT, allowed_files)
                 try:
-                    proposal = proposal_for_strategy(settings, task.task_id, strategy, round_id, "\n".join(summary_lines[-10:]))
+                    proposal = proposal_for_strategy(
+                        settings,
+                        task.task_id,
+                        strategy,
+                        round_id,
+                        "\n".join(summary_lines[-10:]),
+                        frontier_state=frontier_state,
+                        frontier_hint=frontier_hint_text,
+                    )
                 except RuntimeError as exc:
                     failure_message = str(exc).strip().replace("\t", " ").replace("\n", " | ")
                     append_result(
@@ -198,19 +325,48 @@ def run_experiment(
                         confirm_score=None,
                         blind_score=None,
                         status="discard",
+                        decision_reason="worker_failed",
                         failure_type="worker_failed",
+                        failure_mode="worker_failed",
                         training_seconds=None,
                         lines_changed=0,
+                        worker_declared_family="",
+                        worker_declared_subfamily="",
+                        controller_inferred_family="",
+                        controller_inferred_subfamily="",
+                        proposal_family="uncertain",
+                        proposal_subfamily="uncertain",
+                        family_consensus="uncertain",
+                        parent_round_id=parent_round_id,
+                        parent_commit=parent_commit,
+                        search_mode=search_mode,
+                        novelty_level="medium",
+                        confirm_checked=False,
+                        confirm_round_score=None,
+                        confirm_survival=None,
+                        delta_vs_best=None,
+                        delta_vs_parent=None,
                         description=failure_message,
                     )
                     summary_lines.append(
                         json.dumps(
-                            {"round": round_id, "status": "discard", "failure": "worker_failed", "message": failure_message},
+                            {
+                                "round": round_id,
+                                "status": "discard",
+                                "failure": "worker_failed",
+                                "message": failure_message,
+                                "search_mode": search_mode,
+                            },
                             ensure_ascii=False,
                         )
                     )
                     break
                 description = proposal["summary"]
+                worker_declared_family = str(proposal.get("worker_declared_family") or proposal.get("proposal_family") or "other")
+                worker_declared_subfamily = str(proposal.get("worker_declared_subfamily") or proposal.get("proposal_subfamily") or worker_declared_family)
+                parent_round_id = int(proposal.get("parent_round_id")) if proposal.get("parent_round_id") not in {None, ""} else parent_round_id
+                search_mode = str(proposal.get("search_mode") or search_mode)
+                novelty_level = str(proposal.get("novelty_level") or novelty_level)
                 current_dirty = set(changed_files(ROOT))
                 changed_allowed = sorted(
                     path
@@ -230,18 +386,66 @@ def run_experiment(
                         confirm_score=None,
                         blind_score=None,
                         status="discard",
+                        decision_reason="no_op",
                         failure_type="no_op",
+                        failure_mode="no_op",
                         training_seconds=None,
                         lines_changed=0,
+                        worker_declared_family=worker_declared_family,
+                        worker_declared_subfamily=worker_declared_subfamily,
+                        controller_inferred_family="uncertain",
+                        controller_inferred_subfamily="uncertain",
+                        proposal_family=worker_declared_family,
+                        proposal_subfamily=worker_declared_subfamily,
+                        family_consensus="worker_only",
+                        parent_round_id=parent_round_id,
+                        parent_commit=parent_commit,
+                        search_mode=search_mode,
+                        novelty_level=novelty_level,
+                        confirm_checked=False,
+                        confirm_round_score=None,
+                        confirm_survival=None,
+                        delta_vs_best=None,
+                        delta_vs_parent=None,
                         description="no-op proposal",
                     )
                     summary_lines.append(
-                        json.dumps({"round": round_id, "status": "discard", "failure": "no_op", **proposal}, ensure_ascii=False)
+                        json.dumps(
+                            {
+                                "round": round_id,
+                                "status": "discard",
+                                "failure": "no_op",
+                                "proposal_family": worker_declared_family,
+                                "search_mode": search_mode,
+                                **proposal,
+                            },
+                            ensure_ascii=False,
+                        )
                     )
                     continue
                 if unexpected:
                     raise RuntimeError(f"{strategy} worker changed unexpected files: {unexpected}")
                 line_count = changed_line_count(ROOT, changed_allowed)
+                diff = diff_text(ROOT, changed_allowed)
+                controller_family = infer_family_from_text(
+                    description,
+                    str(proposal.get("hypothesis", "")),
+                    str(proposal.get("expected_change", "")),
+                    diff,
+                )
+                controller_subfamily = infer_subfamily_from_text(
+                    controller_family,
+                    description,
+                    str(proposal.get("hypothesis", "")),
+                    str(proposal.get("expected_change", "")),
+                    diff,
+                )
+                proposal_family, family_consensus = canonical_family(worker_declared_family, controller_family)
+                proposal_subfamily = (
+                    worker_declared_subfamily
+                    if family_consensus == "agreed"
+                    else controller_subfamily or worker_declared_subfamily or proposal_family
+                )
                 candidate_commit = commit_paths(
                     ROOT,
                     changed_allowed,
@@ -279,9 +483,27 @@ def run_experiment(
                     confirm_score=None,
                     blind_score=None,
                     status="discard",
+                    decision_reason="train_failed",
                     failure_type="train_failed",
+                    failure_mode="train_failed",
                     training_seconds=None,
                     lines_changed=line_count,
+                    worker_declared_family=worker_declared_family,
+                    worker_declared_subfamily=worker_declared_subfamily,
+                    controller_inferred_family=controller_family,
+                    controller_inferred_subfamily=controller_subfamily,
+                    proposal_family=proposal_family,
+                    proposal_subfamily=proposal_subfamily,
+                    family_consensus=family_consensus,
+                    parent_round_id=parent_round_id,
+                    parent_commit=parent_commit,
+                    search_mode=search_mode,
+                    confirm_checked=False,
+                    confirm_round_score=None,
+                    confirm_survival=None,
+                    delta_vs_best=None,
+                    delta_vs_parent=None,
+                    novelty_level=novelty_level,
                     description=f"{description} [train failed]",
                 )
                 summary_lines.append(
@@ -295,7 +517,27 @@ def run_experiment(
             (logs / f"round_{round_id:03d}.log").write_text(stdout)
             val_score = parse_metric(stdout)
             training_seconds = parse_metric(stdout, "training_seconds")
+            best_score_before = best_score
             status = "keep" if val_score > best_score + 1e-4 else "discard"
+            delta_vs_best = 0.0 if best_score_before == float("-inf") else val_score - best_score_before
+            parent_score = None
+            if parent_round_id is not None:
+                parent_rows = [
+                    row
+                    for row in load_results(settings.results_tsv)
+                    if row["task_id"] == task.task_id
+                    and row["strategy"] == strategy
+                    and int(row["run_id"]) == run_id
+                    and int(row["round_id"]) == parent_round_id
+                ]
+                if parent_rows:
+                    parent_score = _result_float(parent_rows[-1].get("dev_score"))
+            delta_vs_parent = (val_score - parent_score) if parent_score is not None else None
+            if status == "keep":
+                keep_count += 1
+            confirm_checked = should_run_round_confirm(status, keep_count)
+            confirm_round_score = None
+            confirm_survival = None
             if round_id == 1 or status == "keep":
                 best_score = val_score
                 best_commit = current_commit(ROOT) if round_id > 1 else best_commit
@@ -306,6 +548,15 @@ def run_experiment(
             elif round_id > 1:
                 reset_hard(ROOT, best_commit)
 
+            if confirm_checked:
+                confirm_metrics = parse_json_output(
+                    run_python("confirm.py", "--task", task.task_id, "--mode", mode, "--checkpoint", best_checkpoint)
+                )
+                confirm_round_score = float(confirm_metrics["val_score"])
+                confirm_survival = best_confirm_score is None or confirm_round_score >= best_confirm_score - 1e-4
+                if confirm_survival:
+                    best_confirm_score = confirm_round_score
+
             append_result(
                 settings.results_tsv,
                 task_id=task.task_id,
@@ -314,15 +565,47 @@ def run_experiment(
                 round_id=round_id,
                 commit=candidate_commit,
                 dev_score=val_score,
-                confirm_score=None,
+                confirm_score=confirm_round_score,
                 blind_score=None,
                 status=status,
+                decision_reason=decision_reason(status, val_score, best_score_before, None),
                 failure_type=None,
+                failure_mode=infer_failure_mode(None, proposal_family, description),
                 training_seconds=training_seconds,
                 lines_changed=line_count,
+                worker_declared_family=worker_declared_family,
+                worker_declared_subfamily=worker_declared_subfamily,
+                controller_inferred_family=controller_family,
+                controller_inferred_subfamily=controller_subfamily,
+                proposal_family=proposal_family,
+                proposal_subfamily=proposal_subfamily,
+                family_consensus=family_consensus,
+                parent_round_id=parent_round_id,
+                parent_commit=parent_commit,
+                search_mode=search_mode,
+                confirm_checked=confirm_checked,
+                confirm_round_score=confirm_round_score,
+                confirm_survival=confirm_survival,
+                delta_vs_best=delta_vs_best,
+                delta_vs_parent=delta_vs_parent,
+                novelty_level=novelty_level,
                 description=description,
             )
-            summary_lines.append(json.dumps({"round": round_id, "val_score": val_score, "status": status, **proposal}, ensure_ascii=False))
+            summary_lines.append(
+                json.dumps(
+                    {
+                        "round": round_id,
+                        "val_score": val_score,
+                        "status": status,
+                        "proposal_family": proposal_family,
+                        "search_mode": search_mode,
+                        "delta_vs_best": delta_vs_best,
+                        "confirm_round_score": confirm_round_score,
+                        **proposal,
+                    },
+                    ensure_ascii=False,
+                )
+            )
 
         confirm_metrics = parse_json_output(
             run_python("confirm.py", "--task", task.task_id, "--mode", mode, "--checkpoint", best_checkpoint)

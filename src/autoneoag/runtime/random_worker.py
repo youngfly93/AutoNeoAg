@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from autoneoag.runtime.frontier import infer_family_from_text
+
 
 @dataclass(frozen=True)
 class MutationSpec:
@@ -69,7 +71,7 @@ def _apply_mutation(text: str, spec: MutationSpec, rng: random.Random) -> tuple[
     return updated, choice
 
 
-def run_random_worker(round_id: int, root: Path) -> dict[str, object]:
+def run_random_worker(round_id: int, root: Path, frontier_state: dict[str, object] | None = None) -> dict[str, object]:
     rng = random.Random(101 + round_id)
     train_path = root / "train.py"
     original = train_path.read_text()
@@ -81,11 +83,23 @@ def run_random_worker(round_id: int, root: Path) -> dict[str, object]:
             continue
         updated, value = applied
         train_path.write_text(updated)
+        worker_family = infer_family_from_text(spec.field_name, spec.hypothesis, spec.summary_template)
+        parent_round_id = None
+        if frontier_state is not None:
+            champion = frontier_state.get("champion", {})
+            parent_round_id = champion.get("round_id")
         return {
             "hypothesis": spec.hypothesis,
             "expected_change": f"Sample a random mutation on {spec.field_name}.",
             "risk": "Random search may degrade grouped-CV performance and produce non-improving proposals.",
             "edit_scope": ["train.py"],
             "summary": spec.summary_template.format(value=value),
+            "worker_declared_family": worker_family,
+            "worker_declared_subfamily": spec.field_name,
+            "proposal_family": worker_family,
+            "proposal_subfamily": spec.field_name,
+            "parent_round_id": parent_round_id,
+            "search_mode": frontier_state.get("search_mode", "explore") if frontier_state is not None else "explore",
+            "novelty_level": "medium",
         }
     raise RuntimeError("Random worker could not apply any supported mutation to train.py.")

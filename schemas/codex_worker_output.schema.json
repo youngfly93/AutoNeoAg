@@ -5,13 +5,32 @@
     "hypothesis": {"type": "string"},
     "expected_change": {"type": "string"},
     "risk": {"type": "string"},
+    "worker_declared_family": {"type": "string"},
+    "worker_declared_subfamily": {"type": "string"},
+    "proposal_family": {"type": "string"},
+    "proposal_subfamily": {"type": "string"},
+    "parent_round_id": {"type": ["integer", "null"]},
+    "search_mode": {"type": "string", "enum": ["exploit", "explore", "recovery"]},
+    "novelty_level": {"type": "string", "enum": ["low", "medium", "high"]},
     "edit_scope": {
       "type": "array",
       "items": {"type": "string"}
     },
     "summary": {"type": "string"}
   },
-  "required": ["hypothesis", "expected_change", "risk", "edit_scope", "summary"],
+  "required": [
+    "hypothesis",
+    "expected_change",
+    "risk",
+    "worker_declared_family",
+    "worker_declared_subfamily",
+    "proposal_family",
+    "proposal_subfamily",
+    "parent_round_id",
+    "search_mode",
+    "novelty_level",
+    "edit_scope",
+    "summary"
+  ],
   "additionalProperties": false
 }
-

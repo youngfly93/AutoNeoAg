@@ -21,6 +21,8 @@
 - controller 对重复失败方向做降权或临时冻结
 - prompt 不再堆叠长历史，而是提供结构化 frontier hint
 - 每轮搜索都留下可回溯的“方向选择依据”
+- family 标签不只依赖 worker 自报，而是保留 controller 推断结果
+- family 评价不只围绕 dev，也允许低频 confirm 回灌
 
 一句话定义：把当前搜索流程从 `blind search` 升级为 `frontier-guided constrained autoresearch`。
 
@@ -128,6 +130,29 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 
 这样论文写作和后期失败分析才有依据。
 
+### 3.5 family 标签不能完全依赖 worker 自报
+
+worker 输出的 family 很有用，但不能当作真值。  
+更稳的机制是同时保留：
+
+- `worker_declared_family`
+- `controller_inferred_family`
+- `proposal_family`
+
+语义分别是：
+
+- `worker_declared_family`：worker 自报的方向标签
+- `controller_inferred_family`：controller 根据 diff、改动位置、关键模块名、AST 变化做的自动归类
+- `proposal_family`：最终用于统计和调度的 canonical family
+
+默认规则：
+
+- 若两者一致，则直接采用
+- 若两者冲突，则优先采用 `controller_inferred_family`
+- 若 controller 也无法稳定归类，则标记为 `uncertain`
+
+这样可以避免 worker 为了迎合 prompt，把跨 family 的改动误报成“champion 邻域微调”。
+
 ## 4. 目标数据结构改造
 
 ### 4.1 `results.tsv` 扩展字段
@@ -136,8 +161,13 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 
 - 现有字段全部保留
 - 新增以下字段：
+  - `worker_declared_family`
+  - `worker_declared_subfamily`
+  - `controller_inferred_family`
+  - `controller_inferred_subfamily`
   - `proposal_family`
   - `proposal_subfamily`
+  - `family_consensus`
   - `parent_round_id`
   - `parent_commit`
   - `search_mode`
@@ -146,6 +176,9 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
   - `novelty_level`
   - `decision_reason`
   - `failure_mode`
+  - `confirm_checked`
+  - `confirm_round_score`
+  - `confirm_survival`
 
 推荐顺序：
 
@@ -154,30 +187,42 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 3. `run_id`
 4. `round_id`
 5. `commit`
-6. `proposal_family`
-7. `proposal_subfamily`
-8. `parent_round_id`
-9. `parent_commit`
-10. `search_mode`
-11. `dev_score`
-12. `confirm_score`
-13. `blind_score`
-14. `delta_vs_best`
-15. `delta_vs_parent`
-16. `status`
-17. `decision_reason`
-18. `failure_type`
-19. `failure_mode`
-20. `training_seconds`
-21. `lines_changed`
-22. `novelty_level`
-23. `description`
+6. `worker_declared_family`
+7. `worker_declared_subfamily`
+8. `controller_inferred_family`
+9. `controller_inferred_subfamily`
+10. `proposal_family`
+11. `proposal_subfamily`
+12. `family_consensus`
+13. `parent_round_id`
+14. `parent_commit`
+15. `search_mode`
+16. `dev_score`
+17. `confirm_score`
+18. `blind_score`
+19. `confirm_checked`
+20. `confirm_round_score`
+21. `confirm_survival`
+22. `delta_vs_best`
+23. `delta_vs_parent`
+24. `status`
+25. `decision_reason`
+26. `failure_type`
+27. `failure_mode`
+28. `training_seconds`
+29. `lines_changed`
+30. `novelty_level`
+31. `description`
 
 ### 4.2 字段语义
 
-#### `proposal_family`
+#### `worker_declared_family` / `controller_inferred_family` / `proposal_family`
 
-顶层方向家族，controller 和 worker 共用。
+三者的语义不同：
+
+- `worker_declared_family`：worker 自报
+- `controller_inferred_family`：controller 推断
+- `proposal_family`：最终 canonical family，用于统计和调度
 
 建议初始集合：
 
@@ -190,8 +235,9 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 - `auxiliary_head`
 - `fusion_path`
 - `other`
+- `uncertain`
 
-#### `proposal_subfamily`
+#### `worker_declared_subfamily` / `controller_inferred_subfamily` / `proposal_subfamily`
 
 家族内更细的结构标签，例如：
 
@@ -200,6 +246,16 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 - `scalar_context_encoder`
 - `preference_delta_refiner`
 - `contrast_hla_gate`
+
+#### `family_consensus`
+
+建议值：
+
+- `agreed`
+- `controller_override`
+- `worker_only`
+- `controller_only`
+- `uncertain`
 
 #### `parent_round_id`
 
@@ -259,11 +315,19 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 - `oversized_edit`
 - `unknown`
 
+#### `confirm_checked` / `confirm_round_score` / `confirm_survival`
+
+这三列用于低频 confirm 回灌，而不是每轮都跑 confirm：
+
+- `confirm_checked`：本轮是否触发 confirm
+- `confirm_round_score`：若触发 confirm，本轮 confirm 分数
+- `confirm_survival`：本轮 proposal 是否通过 confirm gate
+
 ## 5. proposal family 体系
 
 ### 5.1 初始 family taxonomy
 
-建议 controller 与 worker 共用一份 family 枚举：
+建议 controller 与 worker 共用一份 family 枚举，但 controller 对 canonical family 有最终解释权：
 
 #### `preference_context`
 
@@ -341,6 +405,18 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 这个映射不要求一开始 100% 完美，但必须可重复执行。  
 优先做“稳定可分析”，再追求“家族定义精细”。
 
+### 5.3 controller family 推断建议
+
+controller 的 family 推断不需要一开始就做复杂语义理解，但至少应结合：
+
+- 改动集中在哪些类、函数、模块名
+- diff 中是否出现 `gate`、`contrast`、`preference`、`pairwise`、`rank` 等关键字
+- 是新增模块、替换输入，还是切换 objective
+- AST 层面是否新增 head / encoder / block
+
+第一版可接受“规则表 + 关键字 + 改动位置”的推断逻辑。  
+后续如果需要，再升级成更稳的 AST / diff classifier。
+
 ## 6. Frontier Summarizer 设计
 
 ### 6.1 输出工件
@@ -369,6 +445,11 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
     "proposal_subfamily": "joint_preference_contrast_head"
   },
   "search_mode": "exploit",
+  "confirm_feedback": {
+    "enabled": true,
+    "policy": "every_3_keeps_or_new_best",
+    "last_checked_round": 43
+  },
   "family_stats": [
     {
       "proposal_family": "preference_contrast",
@@ -376,6 +457,9 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
       "keeps": 1,
       "best_gain": 0.014899,
       "recent_trend": "negative",
+      "confirm_checks": 1,
+      "confirm_promotions": 1,
+      "confirm_survival_rate": 1.0,
       "frozen_until_round": null
     }
   ],
@@ -408,6 +492,9 @@ controller 的判断不能只存在 prompt 里，必须落成文件：
 - `last_gain_round`
 - `recent_5_mean`
 - `consecutive_regressions`
+- `confirm_checks`
+- `confirm_promotions`
+- `confirm_survival_rate`
 - `frozen_until_round`
 
 ### 6.4 `frontier_hint.md` 内容模板
@@ -484,14 +571,17 @@ Avoid:
 3. 决定本轮 `search_mode`
 4. 将 `frontier_hint` 与 champion 元信息传给 worker
 5. worker 返回带 family 的 proposal
-6. 训练
-7. 计算 `delta_vs_best` / `delta_vs_parent`
-8. 写入扩展后的 `results.tsv`
-9. 更新 family 状态和冻结状态
+6. controller 基于 diff 推断 `controller_inferred_family`
+7. 合并 worker / controller family，生成 canonical `proposal_family`
+8. 训练
+9. 计算 `delta_vs_best` / `delta_vs_parent`
+10. 若命中低频 confirm 策略，则额外跑 confirm
+11. 写入扩展后的 `results.tsv`
+12. 更新 family 状态和冻结状态
 
 ### 7.3 family 冻结规则
 
-建议默认启用：
+建议默认启用，但明确把它们视作 **v1 启发式**，不是跨任务的最终规律：
 
 - 同一 family 连续 `3` 轮 `delta_vs_best <= -0.03`  
   -> 冻结 `5` 轮
@@ -504,6 +594,12 @@ Avoid:
   - `mean_delta_vs_best < -0.05`
   -> 标记为 `avoid`
 
+实现要求：
+
+- 这些阈值放进配置，不要硬编码在逻辑里
+- `frontier.py` 保留后续升级到 family score / bandit / UCB 风格调度的接口
+- 当前目标是先稳定减少重复无效搜索，而不是一次性做最优策略学习
+
 ### 7.4 搜索模式切换规则
 
 建议：
@@ -513,12 +609,34 @@ Avoid:
 - 若连续 `10` 轮无新 best：切到 `recovery`
 - 若最近两轮都是 `train_failed` 或 `worker_failed`：切到 `exploit`，并缩小 edit 半径
 
+### 7.5 低频 confirm 回灌
+
+为了避免 family 评价只围绕 `dev_score`，建议加入低频 confirm 回灌：
+
+- 默认不在每轮触发 confirm
+- 对每个 `new_best` 触发一次 confirm
+- 或者每累计 `3` 个 `keep`，触发一次 confirm
+
+记录方式：
+
+- 把 confirm 结果写回 `results.tsv`
+- 把 family 的 `confirm_survival_rate` 写入 `family_stats.tsv`
+- 在 `frontier_hint.md` 里提示哪些 family 虽然 dev 上涨，但 confirm 存活率偏低
+
+这样 family 的“优先级”会同时参考：
+
+- dev 改进
+- recent trend
+- confirm survival
+
 ## 8. worker 与 schema 改造
 
 ### 8.1 `codex_worker_output.schema.json` 扩展
 
 建议新增字段：
 
+- `worker_declared_family`
+- `worker_declared_subfamily`
 - `proposal_family`
 - `proposal_subfamily`
 - `parent_round_id`
@@ -534,6 +652,8 @@ Avoid:
   - `edit_scope`
   - `summary`
 - 新增：
+  - `worker_declared_family`
+  - `worker_declared_subfamily`
   - `proposal_family`
   - `proposal_subfamily`
   - `parent_round_id`
@@ -555,10 +675,11 @@ Avoid:
 
 并要求 worker：
 
-- 显式标注 `proposal_family`
+- 显式标注 `worker_declared_family`
 - 如果是 `exploit`，只能做 champion family 的一阶邻域改动
 - 如果是 `explore`，必须说明为什么切到相邻 family
 - 如果是 `recovery`，必须说明为什么当前 champion family 不值得继续重复
+- 不要为了迎合 hint，把跨 family 改动伪装成 champion family 的小修补
 
 ### 8.3 prompt 约束模板
 
@@ -602,6 +723,7 @@ Avoid:
 
 - 在已有 `neoantigen` 历史上可生成稳定 family 统计
 - 当前 champion 和 avoid family 能被正确识别
+- worker 自报与 controller 推断的冲突能被明确记录
 
 ### Phase 3：worker schema 与 prompt 改造
 
@@ -614,6 +736,7 @@ Avoid:
 
 - 连续 5 轮 worker 都能返回合法 family 标签
 - family 标签与人工判断基本一致
+- 出现冲突时，controller 能覆盖 worker 自报并留下 `family_consensus`
 
 ### Phase 4：controller exploit / explore / avoid 调度
 
@@ -627,6 +750,7 @@ Avoid:
 
 - 相同失败 family 不会连续无限重试
 - 当连续多轮无新 best 时，会自动切换主方向
+- 低频 confirm 能对 family 优先级产生可追踪影响
 
 ### Phase 5：回放验证
 
@@ -642,6 +766,7 @@ Avoid:
   - 更早集中到 `round 17/19` 这类方向
   - 更早冻结 `gating`
   - 减少无效 `scalar_contrast` 重复尝试
+  - 在 `hla_immunogenicity` 上更早识别“长期平台但接近 best”的阶段
 
 验收标准：
 
@@ -715,12 +840,14 @@ Avoid:
 
 ## 12. 最小可执行版本
 
-如果只做一个最小版本，建议只实现以下四件事：
+如果只做一个最小版本，建议只实现以下六件事：
 
 1. `results.tsv` 新增 `proposal_family`、`search_mode`、`parent_round_id`
-2. 新增 `frontier_hint.md`
-3. worker prompt 使用 `frontier_hint.md`
-4. controller 加入 family 冻结规则
+2. 同时新增 `worker_declared_family` 与 `controller_inferred_family`
+3. 新增 `frontier_hint.md`
+4. worker prompt 使用 `frontier_hint.md`
+5. controller 加入 family 冻结规则
+6. 对 `new_best` 做低频 confirm 回灌
 
 这样就已经能从 blind search 升级到基础版 direction-aware search。
 
@@ -731,6 +858,13 @@ Avoid:
 - 记住什么方向有效
 - 记住什么方向不值得重复
 - 记住当前最值得优化的是哪条 frontier
+
+但它不应该把“研究记忆”做成“研究偏见”。  
+因此第一版实现必须同时满足：
+
+- family 标签有双轨来源，而不是只信 worker 自报
+- 冻结和调度规则是可配置的启发式，而不是不可质疑的硬规则
+- family 优先级不仅看 dev，还要留下低频 confirm 存活证据
 
 如果当前 AutoNeoAg 要往 framework 论文推进，这套机制值得优先实现，因为它直接对应论文里的核心主张：
 
