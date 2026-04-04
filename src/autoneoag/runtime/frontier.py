@@ -129,6 +129,9 @@ def annotate_rows(rows: list[dict[str, str]]) -> list[dict[str, object]]:
             row.get("expected_change", ""),
         )
         delta_vs_best = _as_float(row.get("delta_vs_best"))
+        confirm_round_score = _as_float(row.get("confirm_round_score") or row.get("confirm_score"))
+        confirm_checked = str(row.get("confirm_checked", "")) in {"1", "true", "True"}
+        run_policy = row.get("run_policy", "") or "fast-dev"
         if delta_vs_best is None:
             if dev_score is None:
                 delta_vs_best = None
@@ -148,6 +151,9 @@ def annotate_rows(rows: list[dict[str, str]]) -> list[dict[str, object]]:
                 "controller_inferred_family": controller_family,
                 "family_consensus": row.get("family_consensus", "") or family_consensus,
                 "delta_vs_best": delta_vs_best,
+                "confirm_round_score": confirm_round_score,
+                "confirm_checked": confirm_checked,
+                "run_policy": run_policy,
                 "status": row.get("status", ""),
                 "failure_type": row.get("failure_type", ""),
                 "confirm_survival": row.get("confirm_survival", ""),
@@ -157,7 +163,12 @@ def annotate_rows(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     return annotated
 
 
-def build_family_stats(annotated_rows: list[dict[str, object]], current_round: int) -> list[dict[str, object]]:
+def build_family_stats(
+    annotated_rows: list[dict[str, object]],
+    current_round: int,
+    champion_confirm_score: float | None = None,
+    strict_confirm: bool = False,
+) -> list[dict[str, object]]:
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
     for row in annotated_rows:
         grouped[str(row.get("proposal_family") or "uncertain")].append(row)
@@ -169,6 +180,17 @@ def build_family_stats(annotated_rows: list[dict[str, object]], current_round: i
         keeps = [row for row in rows if row.get("status") == "keep"]
         confirm_checked = [row for row in rows if str(row.get("confirm_checked", "")) in {"1", "true", "True"}]
         confirm_survived = [row for row in confirm_checked if str(row.get("confirm_survival", "")) in {"1", "true", "True"}]
+        confirm_scores = [float(row["confirm_round_score"]) for row in confirm_checked if row.get("confirm_round_score") is not None]
+        near_misses = [
+            row
+            for row in confirm_checked
+            if row.get("status") != "keep"
+            and row.get("confirm_round_score") is not None
+            and (
+                champion_confirm_score is None
+                or float(row["confirm_round_score"]) >= champion_confirm_score - 0.02
+            )
+        ]
         consecutive_regressions = 0
         for row in reversed(scored):
             delta = row.get("delta_vs_best")
@@ -180,6 +202,10 @@ def build_family_stats(annotated_rows: list[dict[str, object]], current_round: i
             frozen_until_round = str(current_round + 5)
         recent = scored[-5:]
         recent_mean = sum(float(row["delta_vs_best"]) for row in recent if row.get("delta_vs_best") is not None) / max(len(recent), 1)
+        best_confirm = max(confirm_scores) if confirm_scores else None
+        best_confirm_gap = None
+        if best_confirm is not None and champion_confirm_score is not None:
+            best_confirm_gap = best_confirm - champion_confirm_score
         family_stats.append(
             {
                 "proposal_family": family,
@@ -193,19 +219,43 @@ def build_family_stats(annotated_rows: list[dict[str, object]], current_round: i
                 "confirm_checks": len(confirm_checked),
                 "confirm_promotions": len(confirm_survived),
                 "confirm_survival_rate": (len(confirm_survived) / len(confirm_checked)) if confirm_checked else None,
+                "best_confirm_score": best_confirm,
+                "best_confirm_gap": best_confirm_gap,
+                "near_miss_count": len(near_misses),
                 "frozen_until_round": frozen_until_round,
             }
         )
-    family_stats.sort(key=lambda row: (row["attempts"], row.get("best_gain") or -999.0), reverse=True)
+    if strict_confirm:
+        family_stats.sort(
+            key=lambda row: (
+                row.get("best_confirm_score") or -999.0,
+                row["keeps"],
+                row.get("best_gain") or -999.0,
+            ),
+            reverse=True,
+        )
+    else:
+        family_stats.sort(key=lambda row: (row["attempts"], row.get("best_gain") or -999.0), reverse=True)
     return family_stats
 
 
-def choose_search_mode(annotated_rows: list[dict[str, object]], champion_round: int, champion_family: str, family_stats: list[dict[str, object]], current_round: int) -> str:
+def choose_search_mode(
+    annotated_rows: list[dict[str, object]],
+    champion_round: int,
+    champion_family: str,
+    family_stats: list[dict[str, object]],
+    current_round: int,
+    strict_confirm: bool = False,
+    shadow_champion: dict[str, object] | None = None,
+) -> str:
     recent_failures = annotated_rows[-2:]
     if recent_failures and all(row.get("failure_type") in {"train_failed", "worker_failed"} for row in recent_failures):
         return "exploit"
     rounds_since_best = current_round - champion_round
     champion_stats = next((row for row in family_stats if row["proposal_family"] == champion_family), None)
+    if strict_confirm and shadow_champion and rounds_since_best >= 4:
+        if shadow_champion.get("proposal_family") != champion_family:
+            return "explore"
     if champion_stats and champion_stats["frozen_until_round"]:
         frozen_until = int(champion_stats["frozen_until_round"])
         if current_round <= frozen_until:
@@ -217,6 +267,7 @@ def choose_search_mode(annotated_rows: list[dict[str, object]], champion_round: 
 
 def build_frontier_state(task_id: str, strategy: str, run_id: int, current_round: int, rows: list[dict[str, str]]) -> dict[str, object]:
     annotated = annotate_rows(filter_run_rows(rows, task_id, strategy, run_id))
+    strict_confirm = any(str(row.get("run_policy", "")) == "strict-confirm" for row in annotated)
     if not annotated:
         champion = {
             "round_id": 1,
@@ -225,41 +276,92 @@ def build_frontier_state(task_id: str, strategy: str, run_id: int, current_round
             "proposal_family": "uncertain",
             "proposal_subfamily": "uncertain",
         }
+        shadow_champion = None
         family_stats: list[dict[str, object]] = []
         search_mode = "exploit"
     else:
+        keep_rows = [row for row in annotated if row.get("status") == "keep" and row.get("dev_score") is not None]
         scored = [row for row in annotated if row.get("dev_score") is not None]
-        best_row = max(scored, key=lambda row: float(row["dev_score"])) if scored else annotated[0]
+        champion_rows = keep_rows or scored or annotated
+        best_row = max(champion_rows, key=lambda row: float(row.get("dev_score") or float("-inf")))
         champion = {
             "round_id": int(best_row["round_id"]),
             "commit": best_row.get("commit", ""),
             "dev_score": best_row.get("dev_score"),
             "proposal_family": best_row.get("proposal_family", "uncertain"),
             "proposal_subfamily": best_row.get("proposal_subfamily", "uncertain"),
+            "confirm_round_score": best_row.get("confirm_round_score"),
         }
-        family_stats = build_family_stats(annotated, current_round)
+        shadow_candidates = [
+            row
+            for row in annotated
+            if row.get("status") != "keep" and row.get("confirm_round_score") is not None
+        ]
+        shadow_champion = None
+        if shadow_candidates:
+            shadow_row = max(
+                shadow_candidates,
+                key=lambda row: (
+                    float(row.get("confirm_round_score") or float("-inf")),
+                    float(row.get("dev_score") or float("-inf")),
+                ),
+            )
+            shadow_champion = {
+                "round_id": int(shadow_row["round_id"]),
+                "commit": shadow_row.get("commit", ""),
+                "dev_score": shadow_row.get("dev_score"),
+                "proposal_family": shadow_row.get("proposal_family", "uncertain"),
+                "proposal_subfamily": shadow_row.get("proposal_subfamily", "uncertain"),
+                "confirm_round_score": shadow_row.get("confirm_round_score"),
+                "decision_reason": shadow_row.get("decision_reason", ""),
+            }
+        family_stats = build_family_stats(
+            annotated,
+            current_round,
+            champion_confirm_score=_as_float(champion.get("confirm_round_score")),
+            strict_confirm=strict_confirm,
+        )
         search_mode = choose_search_mode(
             annotated_rows=annotated,
             champion_round=int(champion["round_id"]),
             champion_family=str(champion["proposal_family"]),
             family_stats=family_stats,
             current_round=current_round,
+            strict_confirm=strict_confirm,
+            shadow_champion=shadow_champion,
         )
 
     avoid = [
         row["proposal_family"]
         for row in family_stats
         if row["frozen_until_round"]
-        or (row["keeps"] == 0 and row["attempts"] >= 3 and (row["mean_delta_vs_best"] or 0.0) < -0.05)
+        or (
+            row["keeps"] == 0
+            and row["attempts"] >= 3
+            and (row["mean_delta_vs_best"] or 0.0) < -0.05
+            and (row.get("near_miss_count") or 0) == 0
+        )
     ]
     scored_families = []
     for row in family_stats:
         if row["proposal_family"] in avoid:
             continue
-        score = (row["keeps"] * 4) + ((row["best_gain"] or 0.0) * 10) + ((row["confirm_survival_rate"] or 0.0) * 2) - row["consecutive_regressions"]
+        score = (
+            (row["keeps"] * 4)
+            + ((row["best_gain"] or 0.0) * 10)
+            + ((row["confirm_survival_rate"] or 0.0) * 2)
+            + ((row.get("best_confirm_score") or 0.0) * (6 if strict_confirm else 0))
+            + ((row.get("near_miss_count") or 0) * (1.5 if strict_confirm else 0.0))
+            - row["consecutive_regressions"]
+        )
         scored_families.append((score, row["proposal_family"]))
     scored_families.sort(reverse=True)
     prioritize = [family for _, family in scored_families[:3]] or ["preference_context", "preference_contrast", "fusion_path"]
+    near_miss_families = [
+        row["proposal_family"]
+        for row in family_stats
+        if (row.get("near_miss_count") or 0) > 0
+    ][:3]
     recent_fail_patterns = [
         f"{row.get('proposal_family','uncertain')}: {shorten(str(row.get('description','')))}"
         for row in annotated[-5:]
@@ -272,10 +374,15 @@ def build_frontier_state(task_id: str, strategy: str, run_id: int, current_round
         "run_id": run_id,
         "current_round": current_round,
         "champion": champion,
+        "shadow_champion": shadow_champion,
         "search_mode": search_mode,
         "confirm_feedback": {
             "enabled": True,
-            "policy": "every_3_keeps_or_new_best",
+            "policy": (
+                "strict_dev_then_confirm_gate"
+                if any(str(row.get("run_policy", "")) == "strict-confirm" for row in annotated)
+                else "every_3_keeps_or_new_best"
+            ),
             "last_checked_round": max(
                 (
                     int(row["round_id"])
@@ -287,6 +394,7 @@ def build_frontier_state(task_id: str, strategy: str, run_id: int, current_round
         },
         "family_stats": family_stats,
         "prioritize": prioritize,
+        "near_miss_families": near_miss_families,
         "avoid": avoid,
         "recent_fail_patterns": recent_fail_patterns,
     }
@@ -294,15 +402,27 @@ def build_frontier_state(task_id: str, strategy: str, run_id: int, current_round
 
 def render_frontier_hint(state: dict[str, object]) -> str:
     champion = state["champion"]
+    shadow = state.get("shadow_champion")
     priority_lines = "\n".join(f"- {item}" for item in state.get("prioritize", []))
+    near_miss_lines = "\n".join(f"- {item}" for item in state.get("near_miss_families", [])) or "- none"
     avoid_lines = "\n".join(f"- {item}" for item in state.get("avoid", [])) or "- none"
     fail_lines = "\n".join(f"- {item}" for item in state.get("recent_fail_patterns", [])[:5]) or "- none"
+    shadow_block = ""
+    if shadow:
+        shadow_block = (
+            "Shadow champion:\n"
+            f"- round {shadow['round_id']}, family {shadow['proposal_family']}, "
+            f"dev_score {shadow['dev_score']}, confirm_score {shadow['confirm_round_score']}\n\n"
+        )
     return (
         "# Frontier Hint\n\n"
         f"Current champion: round {champion['round_id']}, family {champion['proposal_family']}, "
         f"dev_score {champion['dev_score']}.\n\n"
+        f"{shadow_block}"
         "Successful direction:\n"
         f"{priority_lines}\n\n"
+        "Confirm-aware near-miss families:\n"
+        f"{near_miss_lines}\n\n"
         "Recent failure patterns:\n"
         f"{fail_lines}\n\n"
         f"Expected search_mode: {state['search_mode']}\n\n"
@@ -332,6 +452,9 @@ def write_frontier_artifacts(logs_dir: Path, state: dict[str, object]) -> tuple[
             "confirm_checks",
             "confirm_promotions",
             "confirm_survival_rate",
+            "best_confirm_score",
+            "best_confirm_gap",
+            "near_miss_count",
             "frozen_until_round",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")

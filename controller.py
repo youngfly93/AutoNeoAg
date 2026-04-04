@@ -17,6 +17,13 @@ ensure_project_python(ROOT)
 
 from autoneoag.config import ensure_directories, load_settings
 from autoneoag.runtime.codex_worker import allowed_edit_scope, run_codex_worker
+from autoneoag.runtime.evidence import (
+    create_evidence_bundle,
+    evidence_bundle_path,
+    load_evidence_bundle,
+    update_baseline_record,
+    validate_evidence_bundle,
+)
 from autoneoag.runtime.frontier import (
     build_frontier_state,
     canonical_family,
@@ -35,9 +42,18 @@ from autoneoag.runtime.git_ops import (
     has_commits,
     reset_hard_preserving,
 )
+from autoneoag.runtime.policy import (
+    current_gate_stage,
+    should_run_round_confirm,
+    strict_confirm_gate_passes,
+    strict_dev_gate_passes,
+)
 from autoneoag.runtime.random_worker import run_random_worker
 from autoneoag.runtime.results import append_result, load_results, reset_results_file
 from autoneoag.tasks import get_task_spec, list_task_ids, log_dir, report_path, run_dir as task_run_dir
+
+
+RUN_POLICIES = ("fast-dev", "strict-confirm")
 
 
 def run_python(module: str, *args: str) -> str:
@@ -122,13 +138,17 @@ def count_keeps(settings, task_id: str, strategy: str, run_id: int) -> int:
     return len(rows)
 
 
-def should_run_round_confirm(status: str, keep_count_after_round: int) -> bool:
-    return status == "keep" and (keep_count_after_round == 1 or keep_count_after_round % 3 == 0)
-
-
-def decision_reason(status: str, val_score: float | None, best_score_before: float, failure_type: str | None) -> str:
+def decision_reason(
+    status: str,
+    val_score: float | None,
+    best_score_before: float,
+    failure_type: str | None,
+    strict_reject_reason: str | None = None,
+) -> str:
     if failure_type:
         return failure_type
+    if strict_reject_reason:
+        return strict_reject_reason
     if status == "keep":
         return "new_best"
     if val_score is None:
@@ -151,6 +171,14 @@ def infer_failure_mode(failure_type: str | None, family: str, description: str) 
     if "unstable" in text:
         return "unstable_training"
     return None
+
+
+def verify_evidence_bundle_or_raise(bundle: dict[str, object] | None) -> None:
+    if not bundle:
+        return
+    mismatches = validate_evidence_bundle(bundle)
+    if mismatches:
+        raise RuntimeError("Evidence drift detected: " + "; ".join(mismatches))
 
 
 @dataclass
@@ -213,9 +241,12 @@ def run_experiment(
     strategy: str,
     run_id: int,
     rounds: int,
+    run_policy: str = "fast-dev",
     reset_results: bool = False,
     resume: bool = False,
 ) -> None:
+    if run_policy not in RUN_POLICIES:
+        raise RuntimeError(f"Unsupported run_policy: {run_policy}")
     task = get_task_spec(task_id)
     settings = load_settings(ROOT)
     ensure_directories(settings)
@@ -229,6 +260,23 @@ def run_experiment(
     logs.mkdir(parents=True, exist_ok=True)
     prepare_stdout = run_python("prepare.py", "--task", task.task_id, "--mode", mode)
     (logs / "prepare.log").write_text(prepare_stdout)
+    strict_confirm = run_policy == "strict-confirm"
+    evidence_bundle = None
+    if strict_confirm:
+        evidence_bundle = load_evidence_bundle(logs)
+        if evidence_bundle is None and not resume:
+            evidence_bundle = create_evidence_bundle(
+                settings=settings,
+                task_id=task.task_id,
+                mode=mode,
+                strategy=strategy,
+                run_policy=run_policy,
+                run_id=run_id,
+                logs_dir=logs,
+            )
+        if evidence_bundle is not None:
+            verify_evidence_bundle_or_raise(evidence_bundle)
+    bundle_id = evidence_bundle["bundle_id"] if evidence_bundle is not None else ""
 
     base_branch = current_branch(ROOT) or "main"
     branch_name = f"autoneoag/{task.task_id}/{strategy}/run_{run_id:02d}"
@@ -247,15 +295,38 @@ def run_experiment(
             for row in load_results(settings.results_tsv)
             if row["task_id"] == task.task_id and row["strategy"] == strategy and int(row["run_id"]) == run_id
         ]
+        prior_policies = {row.get("run_policy") or "fast-dev" for row in prior_rows}
+        if prior_policies and prior_policies != {run_policy}:
+            raise RuntimeError(
+                f"Run {task.task_id}/{strategy}/run_{run_id} mixes run_policy values {sorted(prior_policies)} with requested {run_policy}."
+            )
+        if strict_confirm and prior_rows and evidence_bundle is None:
+            raise RuntimeError(
+                f"Strict-confirm resume for {task.task_id}/{strategy}/run_{run_id} requires an existing evidence bundle at "
+                f"{evidence_bundle_path(logs)}."
+            )
+        if strict_confirm and evidence_bundle is None:
+            evidence_bundle = create_evidence_bundle(
+                settings=settings,
+                task_id=task.task_id,
+                mode=mode,
+                strategy=strategy,
+                run_policy=run_policy,
+                run_id=run_id,
+                logs_dir=logs,
+            )
+            bundle_id = evidence_bundle["bundle_id"]
         keep_count = sum(1 for row in prior_rows if row["status"] == "keep")
         confirmed_scores = [
             _result_float(row.get("confirm_round_score") or row.get("confirm_score"))
             for row in prior_rows
-            if row.get("confirm_checked") in {"1", "true", "True"}
+            if row.get("status") == "keep" and row.get("confirm_checked") in {"1", "true", "True"}
         ]
         best_confirm_score = max((score for score in confirmed_scores if score is not None), default=None)
 
         for round_id in range(start_round, rounds + 1):
+            if strict_confirm:
+                verify_evidence_bundle_or_raise(evidence_bundle)
             description = "baseline"
             proposal = {
                 "hypothesis": "baseline",
@@ -320,8 +391,22 @@ def run_experiment(
                         task_id=task.task_id,
                         strategy=strategy,
                         run_id=run_id,
+                        run_policy=run_policy,
+                        evidence_bundle_id=bundle_id,
+                        baseline_bundle_id=bundle_id,
                         round_id=round_id,
                         commit=best_commit,
+                        gate_stage=current_gate_stage(
+                            failure_type="worker_failed",
+                            confirm_gate_required=False,
+                            confirm_checked=False,
+                            dev_passed_gate=False,
+                        ),
+                        dev_passed_gate=False,
+                        confirm_gate_required=False,
+                        confirm_gate_passed=False,
+                        strict_keep_eligible=False,
+                        strict_reject_reason="worker_failed",
                         dev_score=best_score if best_score > float("-inf") else None,
                         confirm_score=None,
                         blind_score=None,
@@ -381,8 +466,22 @@ def run_experiment(
                         task_id=task.task_id,
                         strategy=strategy,
                         run_id=run_id,
+                        run_policy=run_policy,
+                        evidence_bundle_id=bundle_id,
+                        baseline_bundle_id=bundle_id,
                         round_id=round_id,
                         commit=best_commit,
+                        gate_stage=current_gate_stage(
+                            failure_type="no_op",
+                            confirm_gate_required=False,
+                            confirm_checked=False,
+                            dev_passed_gate=False,
+                        ),
+                        dev_passed_gate=False,
+                        confirm_gate_required=False,
+                        confirm_gate_passed=False,
+                        strict_keep_eligible=False,
+                        strict_reject_reason="no_op",
                         dev_score=best_score if best_score > float("-inf") else None,
                         confirm_score=None,
                         blind_score=None,
@@ -453,6 +552,9 @@ def run_experiment(
                     f"{task.task_id} {strategy} run {run_id} round {round_id}: {description}",
                 )
 
+            candidate_checkpoint = str(
+                task_run_dir(settings, task.task_id, mode, strategy, run_id, round_id) / f"round_{round_id:02d}.pt"
+            )
             try:
                 stdout = run_python(
                     "train.py",
@@ -478,8 +580,22 @@ def run_experiment(
                     task_id=task.task_id,
                     strategy=strategy,
                     run_id=run_id,
+                    run_policy=run_policy,
+                    evidence_bundle_id=bundle_id,
+                    baseline_bundle_id=bundle_id,
                     round_id=round_id,
                     commit=candidate_commit,
+                    gate_stage=current_gate_stage(
+                        failure_type="train_failed",
+                        confirm_gate_required=False,
+                        confirm_checked=False,
+                        dev_passed_gate=False,
+                    ),
+                    dev_passed_gate=False,
+                    confirm_gate_required=False,
+                    confirm_gate_passed=False,
+                    strict_keep_eligible=False,
+                    strict_reject_reason="train_failed",
                     dev_score=None,
                     confirm_score=None,
                     blind_score=None,
@@ -519,7 +635,6 @@ def run_experiment(
             val_score = parse_metric(stdout)
             training_seconds = parse_metric(stdout, "training_seconds")
             best_score_before = best_score
-            status = "keep" if val_score > best_score + 1e-4 else "discard"
             delta_vs_best = 0.0 if best_score_before == float("-inf") else val_score - best_score_before
             parent_score = None
             if parent_round_id is not None:
@@ -534,42 +649,125 @@ def run_experiment(
                 if parent_rows:
                     parent_score = _result_float(parent_rows[-1].get("dev_score"))
             delta_vs_parent = (val_score - parent_score) if parent_score is not None else None
-            if status == "keep":
-                keep_count += 1
-            confirm_checked = should_run_round_confirm(status, keep_count)
+            status = "discard"
+            dev_passed_gate = False
+            confirm_gate_required = False
+            confirm_gate_passed = False
+            strict_keep_eligible = False
+            strict_reject_reason = None
             confirm_round_score = None
             confirm_survival = None
-            if round_id == 1 or status == "keep":
-                best_score = val_score
-                best_commit = current_commit(ROOT) if round_id > 1 else best_commit
-                best_round = round_id
-                best_checkpoint = str(
-                    task_run_dir(settings, task.task_id, mode, strategy, run_id, round_id) / f"round_{round_id:02d}.pt"
-                )
-            elif round_id > 1:
-                reset_hard_preserving(ROOT, best_commit, [results_path])
+            confirm_checked = False
 
-            if confirm_checked:
-                confirm_metrics = parse_json_output(
-                    run_python("confirm.py", "--task", task.task_id, "--mode", mode, "--checkpoint", best_checkpoint)
+            if strict_confirm:
+                dev_passed_gate = strict_dev_gate_passes(val_score, best_score_before)
+                confirm_gate_required = dev_passed_gate
+                confirm_checked = confirm_gate_required
+                if confirm_checked:
+                    confirm_metrics = parse_json_output(
+                        run_python("confirm.py", "--task", task.task_id, "--mode", mode, "--checkpoint", candidate_checkpoint)
+                    )
+                    confirm_round_score = float(confirm_metrics["val_score"])
+                    confirm_gate_passed = strict_confirm_gate_passes(confirm_round_score, best_confirm_score)
+                    confirm_survival = confirm_gate_passed
+                strict_keep_eligible = dev_passed_gate and (not confirm_gate_required or confirm_gate_passed)
+                status = "keep" if strict_keep_eligible else "discard"
+                if not dev_passed_gate:
+                    strict_reject_reason = "dev_not_improved"
+                elif confirm_gate_required and not confirm_gate_passed:
+                    strict_reject_reason = "confirm_failed_gate"
+                if status == "keep":
+                    keep_count += 1
+                    best_score = val_score
+                    best_commit = current_commit(ROOT) if round_id > 1 else best_commit
+                    best_round = round_id
+                    best_checkpoint = candidate_checkpoint
+                    if confirm_round_score is not None:
+                        best_confirm_score = confirm_round_score
+                elif round_id > 1:
+                    reset_hard_preserving(ROOT, best_commit, [results_path])
+            else:
+                status = "keep" if val_score > best_score + 1e-4 else "discard"
+                dev_passed_gate = status == "keep" or best_score_before == float("-inf")
+                if status == "keep":
+                    keep_count += 1
+                confirm_checked = should_run_round_confirm(run_policy, status, keep_count, dev_passed_gate)
+                confirm_gate_required = confirm_checked
+                if round_id == 1 or status == "keep":
+                    best_score = val_score
+                    best_commit = current_commit(ROOT) if round_id > 1 else best_commit
+                    best_round = round_id
+                    best_checkpoint = candidate_checkpoint
+                elif round_id > 1:
+                    reset_hard_preserving(ROOT, best_commit, [results_path])
+                if confirm_checked:
+                    confirm_metrics = parse_json_output(
+                        run_python("confirm.py", "--task", task.task_id, "--mode", mode, "--checkpoint", best_checkpoint)
+                    )
+                    confirm_round_score = float(confirm_metrics["val_score"])
+                    confirm_survival = best_confirm_score is None or confirm_round_score >= best_confirm_score - 1e-4
+                    confirm_gate_passed = bool(confirm_survival)
+                    if confirm_survival:
+                        best_confirm_score = confirm_round_score
+                strict_keep_eligible = status == "keep"
+
+            gate_stage = current_gate_stage(
+                failure_type=None,
+                confirm_gate_required=confirm_gate_required,
+                confirm_checked=confirm_checked,
+                dev_passed_gate=dev_passed_gate,
+            )
+            if strict_confirm and round_id == 1 and status == "keep":
+                baseline_metrics_path = logs / "baseline_metrics.json"
+                baseline_metrics_path.write_text(
+                    json.dumps(
+                        {
+                            "task_id": task.task_id,
+                            "strategy": strategy,
+                            "run_id": run_id,
+                            "run_policy": run_policy,
+                            "round_id": round_id,
+                            "commit": best_commit,
+                            "dev_score": val_score,
+                            "confirm_round_score": confirm_round_score,
+                            "checkpoint_path": best_checkpoint,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
                 )
-                confirm_round_score = float(confirm_metrics["val_score"])
-                confirm_survival = best_confirm_score is None or confirm_round_score >= best_confirm_score - 1e-4
-                if confirm_survival:
-                    best_confirm_score = confirm_round_score
+                evidence_bundle = update_baseline_record(
+                    logs,
+                    evidence_bundle,
+                    round_id=round_id,
+                    commit=best_commit,
+                    checkpoint_path=best_checkpoint,
+                    metrics_path=str(baseline_metrics_path),
+                    dev_score=val_score,
+                    confirm_score=confirm_round_score,
+                )
 
             append_result(
                 settings.results_tsv,
                 task_id=task.task_id,
                 strategy=strategy,
                 run_id=run_id,
+                run_policy=run_policy,
+                evidence_bundle_id=bundle_id,
+                baseline_bundle_id=bundle_id,
                 round_id=round_id,
                 commit=candidate_commit,
+                gate_stage=gate_stage,
+                dev_passed_gate=dev_passed_gate,
+                confirm_gate_required=confirm_gate_required,
+                confirm_gate_passed=confirm_gate_passed,
+                strict_keep_eligible=strict_keep_eligible,
+                strict_reject_reason=strict_reject_reason,
                 dev_score=val_score,
                 confirm_score=confirm_round_score,
                 blind_score=None,
                 status=status,
-                decision_reason=decision_reason(status, val_score, best_score_before, None),
+                decision_reason=decision_reason(status, val_score, best_score_before, None, strict_reject_reason),
                 failure_type=None,
                 training_seconds=training_seconds,
                 lines_changed=line_count,
@@ -620,6 +818,8 @@ def run_experiment(
             )
             write_frontier_artifacts(logs, latest_state)
 
+        if strict_confirm:
+            verify_evidence_bundle_or_raise(evidence_bundle)
         confirm_metrics = parse_json_output(
             run_python("confirm.py", "--task", task.task_id, "--mode", mode, "--checkpoint", best_checkpoint)
         )
@@ -634,6 +834,8 @@ def run_experiment(
                     f"task_id: {task.task_id}",
                     f"strategy: {strategy}",
                     f"run_id: {run_id}",
+                    f"run_policy: {run_policy}",
+                    f"evidence_bundle_path: {evidence_bundle_path(logs) if strict_confirm else ''}",
                     f"best_round: {best_round}",
                     f"best_commit: {best_commit}",
                     f"best_val_score: {best_score:.6f}",
@@ -664,6 +866,7 @@ def run_matrix(
     strategies: list[str],
     runs: int,
     rounds: int,
+    run_policy: str,
     reset_results: bool,
     resume: bool = False,
 ) -> None:
@@ -677,6 +880,7 @@ def run_matrix(
                     strategy=strategy,
                     run_id=run_id,
                     rounds=rounds,
+                    run_policy=run_policy,
                     reset_results=reset_results and first,
                     resume=resume,
                 )
@@ -691,6 +895,7 @@ def main() -> None:
     run_parser.add_argument("--task", choices=list_task_ids(), required=True)
     run_parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
     run_parser.add_argument("--strategy", choices=["constrained", "random", "unconstrained"], default="constrained")
+    run_parser.add_argument("--run-policy", choices=list(RUN_POLICIES), default="fast-dev")
     run_parser.add_argument("--run-id", type=int, default=1)
     run_parser.add_argument("--rounds", type=int, default=10)
     run_parser.add_argument("--reset-results", action="store_true")
@@ -700,6 +905,7 @@ def main() -> None:
     matrix_parser.add_argument("--tasks", nargs="+", choices=list_task_ids(), required=True)
     matrix_parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
     matrix_parser.add_argument("--strategies", nargs="+", choices=["constrained", "random", "unconstrained"], required=True)
+    matrix_parser.add_argument("--run-policy", choices=list(RUN_POLICIES), default="fast-dev")
     matrix_parser.add_argument("--runs", type=int, default=1)
     matrix_parser.add_argument("--rounds", type=int, default=10)
     matrix_parser.add_argument("--reset-results", action="store_true")
@@ -710,11 +916,11 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "run":
-        run_experiment(args.task, args.mode, args.strategy, args.run_id, args.rounds, args.reset_results, args.resume)
+        run_experiment(args.task, args.mode, args.strategy, args.run_id, args.rounds, args.run_policy, args.reset_results, args.resume)
     elif args.command == "matrix":
-        run_matrix(args.tasks, args.mode, args.strategies, args.runs, args.rounds, args.reset_results, args.resume)
+        run_matrix(args.tasks, args.mode, args.strategies, args.runs, args.rounds, args.run_policy, args.reset_results, args.resume)
     elif args.command == "smoke":
-        run_experiment("neoantigen", "smoke", "constrained", 1, args.rounds, True)
+        run_experiment("neoantigen", "smoke", "constrained", 1, args.rounds, "fast-dev", True)
 
 
 if __name__ == "__main__":
